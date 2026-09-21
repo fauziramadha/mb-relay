@@ -1,0 +1,13 @@
+{
+  "name": "mb-relay",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "MovieBox Relay (jadikan Public!)",
+      "protocol": "https",
+      "visibility": "public"
+    }
+  },
+  "postStartCommand": "python3 relay.py"
+}
