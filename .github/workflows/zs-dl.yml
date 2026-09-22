@@ -144,7 +144,8 @@ jobs:
           print("codespace Available ✔")
           base = f"https://{NAME}-8080.app.github.dev"
           ok = False
-          while time.time() < deadline:
+          relay_deadline = time.time() + 360  # jendela sendiri: port public
+          while time.time() < relay_deadline:  # + relay start (self-healing)
               try:
                   r = urllib.request.urlopen(base + "/healthz", timeout=15)
                   if r.read() == b"ok":

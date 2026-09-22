@@ -77,8 +77,8 @@ MB_STRAT_OK = None
 MB_DIAG = []
 
 
-def say(msg):
-    print(msg, flush=True)
+def say(*parts):
+    print(" ".join(str(p) for p in parts), flush=True)
 
 
 def summary_line(text):
