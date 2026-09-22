@@ -1,13 +1,15 @@
 {
   "name": "mb-relay",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
   "forwardPorts": [8080],
   "portsAttributes": {
     "8080": {
-      "label": "MovieBox Relay (jadikan Public!)",
-      "protocol": "https",
-      "visibility": "public"
+      "label": "MovieBox Relay",
+      "protocol": "https"
     }
   },
-  "postStartCommand": "python3 relay.py"
+  "postStartCommand": "nohup python3 relay.py > /tmp/relay.log 2>&1 & sh public_port.sh"
 }
