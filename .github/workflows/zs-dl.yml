@@ -1,5 +1,12 @@
 name: ZS Download (MovieBox ke Abyss)
 
+# Cara kerja: runner GitHub HANYA orkestrator (jaringan runner diblokir
+# CDN MovieBox 426 — teruji). Unduhan nyata dilakukan DI DALAM Codespace
+# mb-relay (jaringan Azure yang diterima CDN — teruji 206), lalu
+# dijalankan zs_dl.py di sana: unduh dari CDN → upload ke Abyss →
+# register ke situs. Setelah selesai Codespace DIMATIKAN lagi agar
+# kuota 60 jam/bulan tidak terbakar.
+
 on:
   workflow_dispatch:
     inputs:
@@ -39,18 +46,130 @@ jobs:
   unduh:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    env:
+      CODES_PAT: ${{ secrets.CODES_PAT }}
     steps:
       - uses: actions/checkout@v4
-      - name: Pipeline MovieBox → Abyss
+
+      - name: Susun parameter (JSON)
         env:
-          ZS_TITLE: ${{ inputs.judul }}
-          ZS_PICK: ${{ inputs.pilihan }}
-          ZS_SE: ${{ inputs.musim }}
-          ZS_EP: ${{ inputs.episode }}
-          ZS_QUALITY: ${{ inputs.kualitas }}
-          ZS_SUB: ${{ inputs.subtitle }}
-          ZS_TOKEN: ${{ inputs.token }}
+          I_JUDUL: ${{ inputs.judul }}
+          I_PICK: ${{ inputs.pilihan }}
+          I_MUSIM: ${{ inputs.musim }}
+          I_EPISODE: ${{ inputs.episode }}
+          I_KUALITAS: ${{ inputs.kualitas }}
+          I_SUBTITLE: ${{ inputs.subtitle }}
+          I_TOKEN: ${{ inputs.token }}
           ABYSS_KEY: ${{ secrets.ABYSS_KEY }}
           ABYSS_EMAIL: ${{ secrets.ABYSS_EMAIL }}
           ABYSS_PASSWORD: ${{ secrets.ABYSS_PASSWORD }}
-        run: python3 zs_dl.py
+        run: |
+          python3 - <<'PY'
+          import json, os
+          p = {
+              "title": os.environ["I_JUDUL"],
+              "pick": int(os.environ["I_PICK"] or 0),
+              "se": int(os.environ["I_MUSIM"] or 1),
+              "ep": int(os.environ["I_EPISODE"] or 1),
+              "quality": os.environ["I_KUALITAS"] or "auto",
+              "sub": os.environ["I_SUBTITLE"] or "in_id",
+              "token": os.environ["I_TOKEN"] or "",
+              "abyss_key": os.environ["ABYSS_KEY"],
+              "abyss_email": os.environ["ABYSS_EMAIL"],
+              "abyss_password": os.environ["ABYSS_PASSWORD"],
+          }
+          path = os.path.join(os.environ["RUNNER_TEMP"], "zs-params.json")
+          with open(path, "w") as f:
+              json.dump(p, f)
+          print("params siap — judul:", p["title"], "| kualitas:", p["quality"])
+          PY
+
+      - name: Cari Codespace relay mb-relay
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          PAT = os.environ["CODES_PAT"]
+          req = urllib.request.Request(
+              "https://api.github.com/user/codespaces?per_page=25",
+              headers={"Authorization": f"Bearer {PAT}",
+                       "Accept": "application/vnd.github+json"})
+          data = json.load(urllib.request.urlopen(req, timeout=60))
+          cs = [c for c in data.get("codespaces", [])
+                if c.get("repository", {}).get("full_name") ==
+                "fauziramadha/mb-relay" and c.get("state") != "Deleted"]
+          if not cs:
+              raise SystemExit("Codespace mb-relay tidak ditemukan — buat "
+                               "dari repo (Code → Codespaces → Create).")
+          c0 = sorted(cs, key=lambda c: c.get("last_used_at") or "",
+                      reverse=True)[0]
+          print("codespace:", c0["name"], "| state:", c0["state"])
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"CS_NAME={c0['name']}\n")
+              f.write(f"CS_STATE={c0['state']}\n")
+          PY
+
+      - name: Login gh CLI + bangunkan Codespace
+        run: |
+          echo "$CODES_PAT" | gh auth login --with-token
+          if [ "$CS_STATE" != "Available" ]; then
+            echo "codespace state: $CS_STATE → memulai…"
+            curl -s -o /dev/null -X POST \
+              -H "Authorization: Bearer $CODES_PAT" \
+              "https://api.github.com/user/codespaces/$CS_NAME/start" || true
+          fi
+          python3 - <<'PY'
+          import json, os, time, urllib.request
+          PAT = os.environ["CODES_PAT"]; NAME = os.environ["CS_NAME"]
+          def api(path):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  headers={"Authorization": f"Bearer {PAT}",
+                           "Accept": "application/vnd.github+json"})
+              return json.load(urllib.request.urlopen(req, timeout=60))
+          deadline = time.time() + 420
+          state = "?"
+          while time.time() < deadline:
+              try:
+                  state = api(f"/user/codespaces/{NAME}")["state"]
+              except Exception:
+                  pass
+              if state == "Available":
+                  break
+              print("  codespace state:", state, flush=True)
+              time.sleep(10)
+          if state != "Available":
+              raise SystemExit(f"Codespace belum Available setelah 7 menit "
+                               f"(state: {state}) — coba lagi nanti.")
+          print("codespace Available ✔")
+          base = f"https://{NAME}-8080.app.github.dev"
+          ok = False
+          while time.time() < deadline:
+              try:
+                  r = urllib.request.urlopen(base + "/healthz", timeout=15)
+                  if r.read() == b"ok":
+                      ok = True
+                      break
+              except Exception:
+                  pass
+              print("  tunggu relay port public (self-healing)…", flush=True)
+              time.sleep(10)
+          if not ok:
+              raise SystemExit("Relay tidak menjawab /healthz — port masih "
+                               "private? Cek public_port.sh di codespace.")
+          print("relay hidup ✔  →", base)
+          PY
+
+      - name: Jalankan pipeline DI DALAM Codespace (unduh + upload Abyss)
+        run: |
+          gh codespace cp -c "$CS_NAME" "$RUNNER_TEMP/zs-params.json" \
+            "remote:/tmp/zs-params.json"
+          gh codespace ssh -c "$CS_NAME" -- \
+            "python3 /workspaces/mb-relay/zs_dl.py /tmp/zs-params.json"
+
+      - name: Matikan Codespace lagi (hemat kuota)
+        if: always()
+        run: |
+          curl -s -o /dev/null -X POST \
+            -H "Authorization: Bearer $CODES_PAT" \
+            "https://api.github.com/user/codespaces/$CS_NAME/stop" || true
+          echo "codespace dimatikan ✔"

@@ -44,6 +44,26 @@ ABYSS_KEY = os.environ.get("ABYSS_KEY", "")
 ABYSS_EMAIL = os.environ.get("ABYSS_EMAIL", "")
 ABYSS_PASSWORD = os.environ.get("ABYSS_PASSWORD", "")
 
+# ---- override dari file JSON (argv[1]) — dipakai bila dijalankan dari
+#      workflow Actions melalui SSH (nilai tidak perlu di-quote shell) ----
+if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
+    with open(sys.argv[1], encoding="utf-8") as _f:
+        _p = json.load(_f)
+    TITLE = str(_p.get("title") or TITLE).strip()
+    PICK = int(_p["pick"]) if _p.get("pick") is not None else PICK
+    SEASON = int(_p["se"]) if _p.get("se") is not None else SEASON
+    EPISODE = int(_p["ep"]) if _p.get("ep") is not None else EPISODE
+    QUALITY = str(_p.get("quality") or QUALITY).strip().lower()
+    SUB_LANG = str(_p.get("sub") or SUB_LANG).strip().lower()
+    TOKEN = str(_p.get("token") or TOKEN).strip()
+    ABYSS_KEY = _p.get("abyss_key") or ABYSS_KEY
+    ABYSS_EMAIL = _p.get("abyss_email") or ABYSS_EMAIL
+    ABYSS_PASSWORD = _p.get("abyss_password") or ABYSS_PASSWORD
+    try:
+        os.remove(sys.argv[1])  # hapus file param (berisi kredensial)
+    except OSError:
+        pass
+
 if SUB_LANG in ("none", "no", "off", "tanpa", "-"):
     SUB_LANG = ""
 MB_UUID = str(__import__("uuid").uuid4())
