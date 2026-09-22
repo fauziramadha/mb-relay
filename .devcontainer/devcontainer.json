@@ -11,5 +11,5 @@
       "protocol": "https"
     }
   },
-  "postStartCommand": "nohup python3 relay.py > /tmp/relay.log 2>&1 & sh public_port.sh"
+  "postStartCommand": "git -C . pull --ff-only >/tmp/pull.log 2>&1 || true; nohup python3 relay.py > /tmp/relay.log 2>&1 & sh public_port.sh"
 }

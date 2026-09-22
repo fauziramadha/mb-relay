@@ -19,6 +19,13 @@
 #    GET /probe?url=<file>     uji 1KB dari sisi relay → JSON jawaban CDN
 #    GET /dl?url=<file>&ref=<domain video>
 #                              streaming file (dukung Range/resume)
+#    POST /exec                {"cmd":...} perintah pendek (<110 dtk) —
+#                              HANYA jika env ZS_EXEC_KEY diisi; header
+#                              X-ZS-Key wajib cocok (dipakai workflow
+#                              GitHub Actions utk orkestrasi)
+#    POST /jobstart            {"cmd":...} jalankan perintah PANJANG di
+#                              latar belakang → log /tmp/zs-job.log
+#    GET  /joblog?from=N       ekor log pekerjaan + status hidup/exit
 #
 #  HOST yang DIBOLEHKAN (whitelist — bukan open proxy):
 #    *.hakunaymatata.com  (bcdnxw = file video, cacdn = subtitle)
@@ -39,8 +46,14 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VER = "ZS-MB-RELAY/1.0"
+VER = "ZS-MB-RELAY/1.1"
 PORT = int(os.environ.get("PORT", "8080"))
+EXEC_KEY = os.environ.get("ZS_EXEC_KEY", "")   # kosong → /exec nonaktif
+WORKDIR = "/workspaces/mb-relay" if os.path.isdir("/workspaces/mb-relay") \
+    else os.getcwd()
+JOB_LOG = "/tmp/zs-job.log"
+JOB_DONE = "/tmp/zs-job.done"
+JOB_PID = "/tmp/zs-job.pid"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 H5 = "https://officialmoviebox.com"           # situs katalog MovieBox
@@ -155,6 +168,110 @@ class Relay(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def do_POST(self):
+        """Endpoint orkestrasi (kunci rahasia X-ZS-Key wajib)."""
+        try:
+            path, q = self._q()
+            if not EXEC_KEY:
+                self._json({"error": "exec nonaktif (ZS_EXEC_KEY kosong)"}, 404)
+                return
+            if self.headers.get("X-ZS-Key", "") != EXEC_KEY:
+                self._json({"error": "kunci salah"}, 403)
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if 0 < n < 65536 else b"{}"
+            try:
+                data = json.loads(body or b"{}")
+            except Exception:
+                self._json({"error": "body bukan JSON"}, 400)
+                return
+            cmd = str(data.get("cmd") or "")[:8000]
+            if not cmd:
+                self._json({"error": "cmd kosong"}, 400)
+                return
+            if path == "/exec":
+                self.api_exec(cmd)
+            elif path == "/jobstart":
+                self.api_jobstart(cmd)
+            else:
+                self._json({"error": "endpoint POST tidak ada"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            try:
+                self._send(500, f"relay error: {e!r}".encode())
+            except Exception:
+                pass
+
+    # ---------- POST /exec (perintah pendek, sinkron) ----------
+    def api_exec(self, cmd):
+        import subprocess
+        try:
+            p = subprocess.run(["sh", "-c", cmd], capture_output=True,
+                               timeout=110, cwd=WORKDIR)
+            out = (p.stdout + p.stderr).decode("utf-8", "replace")[:20000]
+            self._json({"code": p.returncode, "out": out})
+        except subprocess.TimeoutExpired:
+            self._json({"code": -1, "out": "timeout 110 detik"})
+        except Exception as e:
+            self._json({"code": -1, "out": repr(e)[:200]})
+
+    # ---------- POST /jobstart (pekerjaan panjang, latar belakang) ----------
+    def api_jobstart(self, cmd):
+        import subprocess
+        for f in (JOB_LOG, JOB_DONE, JOB_PID):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        wrap = f"( {cmd} ) > {JOB_LOG} 2>&1 ; echo $? > {JOB_DONE}"
+        try:
+            p = subprocess.Popen(["sh", "-c", wrap], cwd=WORKDIR,
+                                 start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            with open(JOB_PID, "w") as f:
+                f.write(str(p.pid))
+            self._json({"started": True, "pid": p.pid})
+        except Exception as e:
+            self._json({"started": False, "error": repr(e)[:200]})
+
+    # ---------- GET /joblog?from=N ----------
+    def _pid_alive(pid):
+        try:
+            stat = open(f"/proc/{pid}/stat").read()
+            state = stat.rsplit(")", 1)[1].split()[0]
+            return state != "Z"          # zombie = sudah mati
+        except Exception:
+            return False
+
+    def api_joblog(self, q):
+        frm = int(q.get("from", 0) or 0)
+        size, chunk_b64, alive, done, exit_code = 0, "", False, False, None
+        try:
+            size = os.path.getsize(JOB_LOG)
+            with open(JOB_LOG, "rb") as f:
+                if size > frm:
+                    f.seek(max(frm, size - 65536))
+                    chunk_b64 = __import__("base64").b64encode(
+                        f.read(65536)).decode()
+        except OSError:
+            pass
+        pid = None
+        try:
+            pid = int(open(JOB_PID).read().strip())
+        except Exception:
+            pass
+        if pid:
+            alive = Relay._pid_alive(pid)
+        try:
+            exit_code = int(open(JOB_DONE).read().strip())
+            done = True
+        except Exception:
+            pass
+        self._json({"size": size, "b64": chunk_b64, "alive": alive,
+                    "done": done, "exit": exit_code, "pid": pid})
+
     def route(self):
         path, q = self._q()
         if path in ("", "/", "/help"):
@@ -172,6 +289,8 @@ class Relay(BaseHTTPRequestHandler):
             self.api_probe(q)
         elif path == "/dl":
             self.api_dl(q)
+        elif path == "/joblog":
+            self.api_joblog(q)
         else:
             self._send(404, "endpoint tidak ada — lihat /help".encode())
 

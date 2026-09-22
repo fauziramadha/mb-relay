@@ -2,9 +2,15 @@
 # =====================================================================
 #  zs_dl.py — ZeeStream pipeline: MovieBox → Abyss  (GitHub Actions)
 # =====================================================================
-#  Berjalan di runner GitHub (jaringan Azure — diterima CDN MovieBox,
-#  terbukti dari Codespaces). TANPA Colab, TANPA relay, TANPA kuota
-#  pribadi. Gratis (repo private: 2000 menit runner/bulan).
+#  Berjalan DI DALAM Codespace mb-relay (egress Azure — DITERIMA CDN
+#  MovieBox, teruji 206). Diorkestrasi oleh workflow zs-dl.yml di runner
+#  Actions (egress runner DIBLOKIR CDN 426 — teruji; runner HANYA
+#  membangunkan Codespace, mengirim parameter, memantau log, lalu
+#  mematikan Codespace lagi — 0 byte data film lewat runner).
+#  TANPA Colab, TANPA kuota pribadi.
+#  Biaya: repo PRIVATE = 2.000 menit Actions/bln (±20-40 mnt per film);
+#  + kuota Codespaces 60 jam mesin/bln (auto-stop tiap film).
+#  Repo PUBLIC = menit Actions UNLIMITED gratis.
 #
 #  ENV (dari workflow_dispatch inputs + secrets):
 #    ZS_TITLE    (wajib) kata kunci pencarian judul

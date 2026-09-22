@@ -2,10 +2,10 @@ name: ZS Download (MovieBox ke Abyss)
 
 # Cara kerja: runner GitHub HANYA orkestrator (jaringan runner diblokir
 # CDN MovieBox 426 — teruji). Unduhan nyata dilakukan DI DALAM Codespace
-# mb-relay (jaringan Azure yang diterima CDN — teruji 206), lalu
-# dijalankan zs_dl.py di sana: unduh dari CDN → upload ke Abyss →
-# register ke situs. Setelah selesai Codespace DIMATIKAN lagi agar
-# kuota 60 jam/bulan tidak terbakar.
+# mb-relay (jaringan Azure yang diterima CDN — teruji 206) lewat endpoint
+# /exec milik relay.py: cari judul → unduh dari CDN → upload ke Abyss →
+# register ke situs. Setelah selesai Codespace DIMATIKAN lagi agar kuota
+# 60 jam/bulan tidak terbakar.
 
 on:
   workflow_dispatch:
@@ -48,6 +48,7 @@ jobs:
     timeout-minutes: 150
     env:
       CODES_PAT: ${{ secrets.CODES_PAT }}
+      ZS_EXEC_KEY: ${{ secrets.ZS_EXEC_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -106,11 +107,11 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"CS_NAME={c0['name']}\n")
               f.write(f"CS_STATE={c0['state']}\n")
+              f.write(f"RELAY_URL=https://{c0['name']}-8080.app.github.dev\n")
           PY
 
-      - name: Login gh CLI + bangunkan Codespace
+      - name: Bangunkan Codespace + tunggu relay hidup
         run: |
-          echo "$CODES_PAT" | gh auth login --with-token
           if [ "$CS_STATE" != "Available" ]; then
             echo "codespace state: $CS_STATE → memulai…"
             curl -s -o /dev/null -X POST \
@@ -159,12 +160,65 @@ jobs:
           print("relay hidup ✔  →", base)
           PY
 
-      - name: Jalankan pipeline DI DALAM Codespace (unduh + upload Abyss)
+      - name: Jalankan pipeline DI DALAM Codespace (via relay /exec)
         run: |
-          gh codespace cp -c "$CS_NAME" "$RUNNER_TEMP/zs-params.json" \
-            "remote:/tmp/zs-params.json"
-          gh codespace ssh -c "$CS_NAME" -- \
-            "python3 /workspaces/mb-relay/zs_dl.py /tmp/zs-params.json"
+          python3 - <<'PY'
+          import base64, json, os, time, urllib.request
+
+          BASE = os.environ["RELAY_URL"]
+          KEY = os.environ["ZS_EXEC_KEY"]
+
+          def post(path, obj):
+              req = urllib.request.Request(
+                  BASE + path, data=json.dumps(obj).encode(), method="POST",
+                  headers={"Content-Type": "application/json",
+                           "X-ZS-Key": KEY})
+              with urllib.request.urlopen(req, timeout=130) as r:
+                  return json.loads(r.read() or b"{}")
+
+          def get(path):
+              req = urllib.request.Request(BASE + path,
+                                           headers={"X-ZS-Key": KEY})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read())
+
+          # 1. kirim parameter (base64 agar aman dari quoting shell)
+          params = open(os.environ["RUNNER_TEMP"] +
+                        "/zs-params.json", "rb").read()
+          b64 = base64.b64encode(params).decode()
+          r = post("/exec", {"cmd":
+                  f"echo {b64} | base64 -d > /tmp/zs-params.json && echo OK"})
+          print("kirim params:", r.get("code"), r.get("out", "")[:40])
+          assert "OK" in r.get("out", ""), f"gagal kirim params: {r}"
+
+          # 2. mulai pekerjaan panjang di codespace
+          cmd = ("cd /workspaces/mb-relay && "
+                 "python3 zs_dl.py /tmp/zs-params.json")
+          r = post("/jobstart", {"cmd": cmd})
+          print("pekerjaan dimulai:", r)
+          assert r.get("started"), f"jobstart gagal: {r}"
+
+          # 3. pantau log sampai selesai (maks 2 jam)
+          off, deadline, exit_code = 0, time.time() + 7200, None
+          while time.time() < deadline:
+              j = get(f"/joblog?from={off}")
+              if j.get("size", 0) > off:
+                  chunk = base64.b64decode(j.get("b64", "")) \
+                      .decode("utf-8", "replace")
+                  print(chunk, end="", flush=True)
+                  off = j["size"]
+              if j.get("done") and not j.get("alive"):
+                  exit_code = j.get("exit")
+                  break
+              time.sleep(10)
+          if exit_code is None:
+              raise SystemExit("pekerjaan tidak selesai dalam 2 jam / "
+                               "log terputus")
+          print(f"\n== exit code codespace: {exit_code} ==")
+          if exit_code != 0:
+              raise SystemExit(f"pipeline gagal di codespace (exit {exit_code})")
+          print("PIPELINE SELESAI ✔")
+          PY
 
       - name: Matikan Codespace lagi (hemat kuota)
         if: always()
