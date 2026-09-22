@@ -1,0 +1,56 @@
+name: ZS Download (MovieBox ke Abyss)
+
+on:
+  workflow_dispatch:
+    inputs:
+      judul:
+        description: "Judul film/serial (kata kunci pencarian; Inggris lebih akurat)"
+        required: true
+      pilihan:
+        description: "Indeks hasil pencarian kalau ada beberapa (default 0)"
+        required: false
+        default: "0"
+      musim:
+        description: "Musim ke berapa (SERIAL saja; film biarkan 1)"
+        required: false
+        default: "1"
+      episode:
+        description: "Episode ke berapa (SERIAL saja; film biarkan 1)"
+        required: false
+        default: "1"
+      kualitas:
+        description: "auto / 1080 / 720 / 360 (default auto = tertinggi gratis)"
+        required: false
+        default: "auto"
+      subtitle:
+        description: "in_id / ms / en / none (default in_id)"
+        required: false
+        default: "in_id"
+      token:
+        description: "TOKEN dari Admin → Server 3 (opsional; isi agar otomatis register ke situs)"
+        required: false
+        default: ""
+
+concurrency:
+  group: zs-dl
+  cancel-in-progress: false
+
+jobs:
+  unduh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pipeline MovieBox → Abyss
+        env:
+          ZS_TITLE: ${{ inputs.judul }}
+          ZS_PICK: ${{ inputs.pilihan }}
+          ZS_SE: ${{ inputs.musim }}
+          ZS_EP: ${{ inputs.episode }}
+          ZS_QUALITY: ${{ inputs.kualitas }}
+          ZS_SUB: ${{ inputs.subtitle }}
+          ZS_TOKEN: ${{ inputs.token }}
+          ABYSS_KEY: ${{ secrets.ABYSS_KEY }}
+          ABYSS_EMAIL: ${{ secrets.ABYSS_EMAIL }}
+          ABYSS_PASSWORD: ${{ secrets.ABYSS_PASSWORD }}
+        run: python3 zs_dl.py

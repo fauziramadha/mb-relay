@@ -1,0 +1,72 @@
+name: ZS Probe (uji jaringan runner vs CDN MovieBox)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe CDN MovieBox dari runner Azure
+        run: |
+          python3 - <<'PY'
+          import json, re, subprocess, urllib.request, urllib.error
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          H5 = "https://officialmoviebox.com"
+
+          def get(url, hdrs=None, timeout=40):
+              h = {"User-Agent": UA, "accept": "application/json"}
+              if hdrs: h.update(hdrs)
+              return urllib.request.urlopen(
+                  urllib.request.Request(url, headers=h), timeout=timeout)
+
+          print("=" * 60)
+          ip = get("https://api.ipify.org", timeout=15).read().decode().strip()
+          print("IP egress runner :", ip)
+          dom = json.load(get(f"{H5}/wefeed-h5api-bff/media-player/get-domain",
+                              {"X-Client-Type": "h5"})).get("data", "").rstrip("/")
+          print("Domain video     :", dom)
+
+          pj = json.load(get(
+              f"{dom}/wefeed-h5api-bff/subject/play?subjectId=0&se=0&ep=0"
+              f"&detailPath=inception-e1BOR6f19C7",
+              {"Referer": f"{dom}/spa/videoPlayPage/movies/inception-e1BOR6f19C7",
+               "x-client-info": '{"timezone":"Asia/Jakarta"}'}))
+          st = min([s for s in pj["data"]["streams"] if not s.get("vipLocked")],
+                   key=lambda s: int(s.get("size") or 0))
+          url = st["url"]
+          print("File uji         :", urllib.request.urlparse(url).netloc,
+                f"({int(st.get('size') or 0)/1e6:.0f} MB stream terkecil)")
+
+          # uji 1KB via urllib
+          code_u, head_u = None, b""
+          try:
+              r = get(url, {"Referer": dom + "/", "Range": "bytes=0-1023"}, 40)
+              code_u, head_u = r.getcode(), r.read(16)
+              r.close()
+          except urllib.error.HTTPError as e:
+              code_u = e.code
+          except Exception as e:
+              print("urllib error:", repr(e)[:120])
+          print("PROBE urllib     : HTTP", code_u, head_u[:8])
+
+          # uji 1KB via curl
+          p = subprocess.run(["curl", "-sS", "--max-time", "40", "-r", "0-1023",
+                              "-H", f"Referer: {dom}/",
+                              "-w", "\\n__C__%{http_code}", url],
+                             capture_output=True, timeout=60)
+          body, tail = p.stdout.rsplit(b"\n__C__", 1) if b"\n__C__" in p.stdout else (p.stdout, b"?")
+          print("PROBE curl       : HTTP", tail.decode().strip(), body[:8])
+
+          ok = code_u in (200, 206)
+          print("=" * 60)
+          if ok:
+              print("VERDICT: LOLOS ✔ — jaringan runner Azure DITERIMA CDN")
+              print("Pipeline zs_dl.py siap dipakai tanpa relay.")
+          else:
+              print("VERDICT: DITOLAK ✘ — runner GitHub diblokir CDN juga.")
+          print("=" * 60)
+          PY
