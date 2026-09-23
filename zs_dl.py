@@ -621,7 +621,7 @@ def main():
         subs = []
         if sub_text:
             subs = [{"lang": sub_lan or "Indonesia",
-                     "filename": "indonesia.srt",
+                     "filename": f"{lang_slug(sub_lan)}.srt",
                      "content": sub_text, "srt": True}]
         body = json.dumps({"slug": slug, "quality": f"{res}p",
                            "size": size, "subs": subs}).encode()
@@ -649,39 +649,115 @@ def main():
         summary_line("- Register: ⏭ dilewati (token kosong) — daftarkan slug "
                      "via Admin → Server 3")
 
-    # 8. pasang subtitle ke player Abyss (kalau ada + register sukses)
-    if sub_text and reg_ok and ABYSS_EMAIL and ABYSS_PASSWORD:
+    # 8. pasang subtitle ke player Abyss (native CC — best-effort).
+    # Dijalankan walau register di-skip: track CC di player.abyssplayer.com
+    # berguna juga saat film dibuka langsung dari Abyss.
+    # CATATAN PENTING (fix 403, teruji 2026-09-23): api.abyss.to menolak
+    # request TANPA User-Agent (Python-urllib) dengan 403 Forbidden —
+    # keduanya (login + PUT) HARUS memakai curl + UA browser.
+    sub_player_ok = False
+    if sub_text and ABYSS_EMAIL and ABYSS_PASSWORD:
         try:
             say("\nMemasang subtitle ke player Abyss…")
-            login = json.load(urllib.request.urlopen(
-                urllib.request.Request(
-                    "https://api.abyss.to/auth/login",
-                    data=json.dumps({"email": ABYSS_EMAIL,
-                                     "password": ABYSS_PASSWORD}).encode(),
-                    headers={"Content-Type": "application/json"}), timeout=60))
-            jwt = login.get("token")
+            lang = (sub_lan or "Indonesia").strip()
+            fname = f"{lang_slug(lang)}.vtt"
+            vtt = srt_to_vtt(sub_text)
+            jwt = abyss_login(ABYSS_EMAIL, ABYSS_PASSWORD)
             if jwt:
-                rr = urllib.request.urlopen(
-                    urllib.request.Request(
-                        f"https://api.abyss.to/v1/upload/subtitles/{slug}"
-                        f"?language={urllib.parse.quote(sub_lan or 'Indonesia')}"
-                        f"&filename=indonesia.srt",
-                        data=sub_text.encode("utf-8"), method="PUT",
-                        headers={"Authorization": "Bearer " + jwt}), timeout=120)
-                say("  subtitle → HTTP", rr.status)
+                code = abyss_put_subtitle(jwt, slug, lang, fname, vtt)
+                if code == 200:
+                    say(f"  subtitle player OK (HTTP 200) — label CC: {lang}")
+                    sub_player_ok = True
+                else:
+                    say(f"  subtitle player HTTP {code} — TIDAK fatal: subtitle "
+                        "tetap aktif di halaman film situs via injeksi ZeeStream")
             else:
-                say("  login Abyss gagal — subtitle hanya di arsip CMS")
+                say("  login Abyss gagal — TIDAK fatal: subtitle tetap aktif "
+                    "di halaman film situs via injeksi ZeeStream")
         except Exception as e:
-            say("  subtitle player dilewati:", repr(e)[:120])
+            say("  subtitle player dilewati:", repr(e)[:120],
+                "(TIDAK fatal — subtitle situs tetap aktif via injeksi)")
+    elif sub_text:
+        say("\nSubtitle tetap terpasang di halaman film situs (injeksi ZeeStream); "
+            "track native Abyss dilewati (ABYSS_EMAIL/PASSWORD kosong).")
 
     say("\n" + "=" * 58)
     if reg_ok:
-        say("SUKSES! Judul TERSEDIA di Server 3 situs kamu.")
-        say("Buka halaman filmnya → pilih Server 3 → putar!")
+        say(f"SUKSES! Judul TERSEDIA di Server 3 situs kamu.")
+        if sub_text:
+            say(f"Subtitle {sub_lan or 'Indonesia'} aktif: buka halaman film → "
+                "Server 3 → CC. (Track native Abyss: "
+                + ("terpasang" if sub_player_ok else "best-effort") + ".)")
+            say("Kalau timing subtitle kurang pas, atur Sinkron (± detik) "
+                "di Admin → Subtitle — langsung terasa tanpa unduh ulang.")
+        say("Putar sekarang!")
     else:
         say("SELESAI (upload Abyss OK). Slug:", slug)
         say("Lanjutkan register via Admin / token agar muncul di situs.")
     say("=" * 58)
+
+
+def lang_slug(name):
+    """"English" → "english"; "Indonesia" → "indonesia" (nama file aman)."""
+    s = re.sub(r"[^a-z0-9]+", "_", (name or "indonesia").strip().lower()).strip("_")
+    return s or "indonesia"
+
+
+def srt_to_vtt(text):
+    """SRT → VTT ringan: koma → titik milidetik + header WEBVTT.
+    (Abyss menerima keduanya, tapi VTT teruji 200 pada 2026-09-23.)"""
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"(\d\d:\d\d:\d\d),(\d\d\d)", r"\1.\2", t)
+    if not t.lstrip().startswith("WEBVTT"):
+        t = "WEBVTT\n\n" + t.lstrip("\ufeff")
+    return t
+
+
+def abyss_login(email, password):
+    """Login Abyss via curl + UA browser → JWT (None bila gagal 2x).
+    urllib polos DITOLAK 403 oleh Cloudflare di depan api.abyss.to."""
+    for attempt in range(2):
+        p = subprocess.run(
+            ["curl", "-sS", "--max-time", "60", "-A", UA,
+             "-X", "POST", "-H", "Content-Type: application/json",
+             "-d", json.dumps({"email": email, "password": password}),
+             "https://api.abyss.to/auth/login"],
+            capture_output=True, timeout=75)
+        try:
+            tok = json.loads(p.stdout or b"{}").get("token")
+            if tok:
+                return tok
+        except Exception:
+            pass
+        time.sleep(5)
+    return None
+
+
+def abyss_put_subtitle(jwt, slug, language, filename, vtt_text):
+    """PUT subtitle ke player Abyss (CC native) — HTTP code.
+    Retry 3x: API ini kadang menjawab 5xx sesaat."""
+    url = (f"https://api.abyss.to/v1/upload/subtitles/{slug}"
+           f"?language={urllib.parse.quote(language)}"
+           f"&filename={urllib.parse.quote(filename)}")
+    code = None
+    for attempt in range(3):
+        p = subprocess.run(
+            ["curl", "-sS", "--max-time", "120", "-A", UA,
+             "-X", "PUT",
+             "-H", f"Authorization: Bearer {jwt}",
+             "-H", "Content-Type: text/plain; charset=utf-8",
+             "--data-binary", vtt_text,
+             "-o", "/dev/null", "-w", "%{http_code}",
+             url],
+            capture_output=True, timeout=135)
+        try:
+            code = int(p.stdout.decode().strip() or "0")
+        except Exception:
+            code = 0
+        if code == 200:
+            return code
+        time.sleep(6)
+    return code
 
 
 if __name__ == "__main__":
