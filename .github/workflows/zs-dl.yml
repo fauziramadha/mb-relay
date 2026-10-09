@@ -129,6 +129,7 @@ jobs:
               return json.load(urllib.request.urlopen(req, timeout=60))
           deadline = time.time() + 420
           state = "?"
+          last_start = 0.0
           while time.time() < deadline:
               try:
                   state = api(f"/user/codespaces/{NAME}")["state"]
@@ -136,6 +137,24 @@ jobs:
                   pass
               if state == "Available":
                   break
+              # POST /start ulang tiap 60 dtk bila masih mati/bertransisi —
+              # menutup race: POST pertama (bash, || true) bisa ditelan saat
+              # codespace masih ShuttingDown → tanpa ini start tak pernah
+              # terjadi dan polling menunggu 7 menit sia-sia (kasus nyata
+              # run 9 Okt: state stuck Shutting→Shutdown 7 menit).
+              if state in ("Shutdown", "ShuttingDown") and \
+                      time.time() - last_start > 60:
+                  try:
+                      req = urllib.request.Request(
+                          "https://api.github.com/user/codespaces/"
+                          + NAME + "/start", method="POST",
+                          headers={"Authorization": f"Bearer {PAT}",
+                                   "Accept": "application/vnd.github+json"})
+                      urllib.request.urlopen(req, timeout=30).read()
+                  except Exception:
+                      pass
+                  last_start = time.time()
+                  print("  → POST /start ulang (race shutdown)", flush=True)
               print("  codespace state:", state, flush=True)
               time.sleep(10)
           if state != "Available":
