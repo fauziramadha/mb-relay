@@ -12,6 +12,12 @@
 #  + kuota Codespaces 60 jam mesin/bln (auto-stop tiap film).
 #  Repo PUBLIC = menit Actions UNLIMITED gratis.
 #
+#  v1.2 — KEBERSIHAN DISK (codespace persisten!): film .mp4 TIDAK lagi
+#  menumpuk. (a) Sisa film dari run sebelumnya dihapus otomatis saat
+#  pipeline mulai; (b) setelah upload ke Abyss BERHASIL, file lokal
+#  langsung dihapus — register/subtitle hanya butuh metadata (slug,
+#  size, sub_text), bukan file. Disk Codespace selalu bersih antar-film.
+#
 #  ENV (dari workflow_dispatch inputs + secrets):
 #    ZS_TITLE    (wajib) kata kunci pencarian judul
 #    ZS_PICK     indeks hasil pencarian (default "0")
@@ -453,6 +459,37 @@ def fail(msg):
     sys.exit(1)
 
 
+def clean_old_media(min_bytes=50 * 1024 * 1024):
+    """Hapus sisa video pipeline sebelumnya dari folder kerja.
+
+    Disk Codespace PERSISTEN antar-run: tanpa pembersihan ini, setiap film
+    yang diunduh menumpuk sampai 'Disk tidak cukup' pada run berikutnya.
+    Hanya file media besar (>50 MB) yang dihapus — file kecil/proyek aman.
+    Return (jumlah_file, total_byte) yang dikembalikan.
+    """
+    exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts")
+    n = total = 0
+    try:
+        names = os.listdir(".")
+    except OSError:
+        return 0, 0
+    for name in names:
+        try:
+            if not os.path.isfile(name):
+                continue
+            if not name.lower().endswith(exts):
+                continue
+            sz = os.path.getsize(name)
+            if sz < min_bytes:
+                continue
+            os.remove(name)
+            n += 1
+            total += sz
+        except OSError:
+            pass
+    return n, total
+
+
 def main():
     if not TITLE:
         fail("Input 'judul' kosong — isi kata kunci pencarian.")
@@ -463,6 +500,16 @@ def main():
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")
     summary_line(f"# ZS Download — {TITLE}")
     summary_line(f"- IP runner: `{egress}`")
+
+    # 0. bersihkan sisa film run sebelumnya — disk Codespace persisten,
+    #    tanpa ini file lama menumpuk sampai 'Disk tidak cukup'.
+    n_old, b_old = clean_old_media()
+    if n_old:
+        say(f"🧹 Bersih-bersih: {n_old} file film lama dihapus, "
+            f"{b_old/1e9:.2f} GB dikembalikan ke disk.")
+        summary_line(f"- Bersih-bersih: {n_old} file lama ({b_old/1e9:.2f} GB)")
+        st0 = shutil.disk_usage(".")
+        say(f"   Disk kini bebas: {st0.free/1e9:.1f} GB")
 
     # 1. cari judul
     results = mb_search(TITLE)
@@ -520,12 +567,13 @@ def main():
     say(f"\nFile tujuan: {FILE}  (kualitas {res}p, "
         f"{int(stream.get('size') or 0)/1e6:.0f} MB)")
 
-    # ruang disk runner
+    # ruang disk runner (SETELAH bersih-bersih otomatis di atas)
     st_disk = shutil.disk_usage(".")
     need = int(stream.get("size") or 0) * 1.15
     if need > st_disk.free:
-        fail(f"Disk runner tidak cukup (butuh {need/1e9:.1f} GB, "
-             f"sisa {st_disk.free/1e9:.1f} GB) — pilih resolusi lebih rendah.")
+        fail(f"Disk tidak cukup (butuh {need/1e9:.1f} GB, sisa "
+             f"{st_disk.free/1e9:.1f} GB — sisa film lama sudah dibersihkan "
+             "otomatis) — pilih resolusi lebih rendah (mis. 720).")
 
     # 3. unduh video
     ok = mb_smart_download(DOMAIN, DP, se, ep, res, FILE)
@@ -593,6 +641,21 @@ def main():
     say("Slug Abyss:", slug, "→", up.get("urlIframe"))
     summary_line(f"- Slug Abyss: `{slug}`")
     summary_line(f"- Player: {up.get('urlIframe', '')}")
+
+    # 5b. HAPUS FILE LOKAL — film sudah aman di Abyss. Register ke situs
+    #     & pemasangan subtitle hanya butuh metadata (slug, size, sub_text),
+    #     bukan file lokal. Disk Codespace langsung dikembalikan supaya
+    #     run berikutnya tidak kehabisan ruang (disk Codespace persisten).
+    try:
+        os.remove(FILE)
+        st5 = shutil.disk_usage(".")
+        say(f"🗑 File lokal dihapus ({size/1e9:.2f} GB dikembalikan) — "
+            f"disk bebas {st5.free/1e9:.1f} GB untuk film berikutnya.")
+        summary_line(f"- Disk: file lokal dihapus ({size/1e9:.2f} GB) "
+                     "setelah upload Abyss")
+    except OSError as e:
+        say("⚠ Gagal menghapus file lokal:", repr(e)[:100],
+            "(tidak fatal — akan dibersihkan di run berikutnya)")
 
     # 6. tunggu transcode ready (maks 15 menit)
     say("\nMenunggu Abyss men-transcode (maks 15 menit)…")

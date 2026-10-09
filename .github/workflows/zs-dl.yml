@@ -192,6 +192,19 @@ jobs:
           print("kirim params:", r.get("code"), r.get("out", "")[:40])
           assert "OK" in r.get("out", ""), f"gagal kirim params: {r}"
 
+          # 1b. sinkronkan kode terbaru ke codespace (non-fatal).
+          #     Saat codespace dibangunkan, postStartCommand sudah menarik
+          #     git pull otomatis; langkah ini menutup celah saat codespace
+          #     SUDAH hidup sebelum workflow jalan (pull start tidak terpicu)
+          #     — agar perbaikan zs_dl.py terbaru selalu terpakai.
+          r = post("/exec", {"cmd":
+                  "cd /workspaces/mb-relay && "
+                  "(git pull --ff-only 2>&1 | tail -n 1; echo SYNC) || "
+                  "echo SYNC-SKIP"})
+          out1b = (r.get("out") or "").strip().splitlines()
+          print("sync kode:", r.get("code"),
+                out1b[-1] if out1b else "(tanpa jawaban)")
+
           # 2. mulai pekerjaan panjang di codespace
           cmd = ("cd /workspaces/mb-relay && "
                  "python3 zs_dl.py /tmp/zs-params.json")
