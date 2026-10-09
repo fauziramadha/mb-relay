@@ -105,10 +105,23 @@ ke repo = Codespace otomatis memakainya saat dibangunkan berikutnya.
    dimatikan otomatis** — kuota Codespaces tidak terbakar idle.
 
 Kronologi di balik layar: bangunkan Codespace (± 1-3 menit, termasuk
-self-heal port) → cari judul → unduh dari CDN (terukur ± 5,4 MB/s di dalam
-Codespace) → upload ke Abyss → tunggu transcode (maks 15 menit, tidak
-menghalangi register) → register ke situs (bila token diisi) → pasang
-subtitle → matikan Codespace.
+self-heal port) → **bersihkan sisa film lama** (🧹 otomatis) → cari
+judul → unduh dari CDN (terukur ± 5,4 MB/s di dalam Codespace) →
+upload ke Abyss → **file lokal dihapus otomatis segera setelah upload
+sukses** (slug keluar = film aman di Abyss) → tunggu transcode (maks 15
+menit, tidak menghalangi register) → register ke situs (bila token
+diisi) → pasang subtitle → matikan Codespace.
+
+**Disk Codespace selalu ramping (auto 🧹):** disk Codespace itu
+persisten (di-*stop*, bukan dihapus) — tanpa pembersihan otomatis,
+film lama menumpuk sampai run baru ditolak "Disk Codespace tidak
+cukup". Sekarang ada 2 lapis: (1) awal run — semua sisa video run
+sebelumnya dihapus **kecuali** film yang jadi target run ini (file
+setengah-jadi bisa dilanjutkan/resume, film lengkap dipakai ulang
+tanpa unduh ulang); (2) setelah upload sukses — file lokal dihapus
+**segera**. Satu-satunya saat file bertahan: upload Abyss ditolak
+(3x) supaya run ulang judul yang sama tinggal upload ulang tanpa
+mengunduh lagi.
 
 ---
 
@@ -148,10 +161,10 @@ pipeline ini memang on-demand (jalan hanya saat kamu meminta film).
 
 | Gejala | Sebab & solusi |
 |---|---|
+| `Disk Codespace tidak cukup` | Versi lama: film lama menumpuk. Versi sekarang: sisa lama otomatis dibersihkan di awal run — kalau masih tidak cukup, berarti filmnya memang lebih besar dari sisa disk; pilih resolusi lebih rendah, atau hapus Codespace lama lalu buat baru (repo → Code → Codespaces). |
 | `Codespace mb-relay tidak ditemukan` | Codespace terhapus. Buka repo → tombol **Code** → tab **Codespaces** → **Create codespace on main**. Workflow otomatis menemukan Codespace repo yang terakhir dipakai — tidak ada nama yang di-hardcode. |
 | `Relay tidak menjawab /healthz` | Port kembali private setelah tidur → `public_port.sh` menyembuhkan otomatis (± 1-3 mnt). Kalau lebih dari 5 menit: github.com/codespaces → **Restart**, lalu run ulang. |
 | `426` di log unduhan | Kamu menjalankan versi lama (runner mengunduh langsung). Pastikan repo tersinkron (zs-dl.yml terbaru = runner hanya orkestrator). |
-| `Disk tidak cukup` saat mau unduh | **Sudah diperbaiki (v1.2).** Dulu film `.mp4` menumpuk di disk Codespace yang persisten antar-run. Sekarang: (a) sisa film lama dihapus otomatis di awal tiap pipeline; (b) film lokal **langsung dihapus begitu upload Abyss berhasil** — register & subtitle hanya butuh metadata, bukan file. Kalau masih muncul: resolusi filmnya memang lebih besar dari sisa disk — pilih `720`. |
 | Film tidak muncul di situs padahal run SUKSES | Input **token** kosong — film tetap ada di Abyss (slug tertera di log). Daftarkan manual: Admin → Server 3 → tempel slug, ATAU run ulang workflow dengan judul sama + token. |
 | Transcode Abyss > 15 menit | Tidak masalah — register tetap dilakukan; status bisa dicek di dashboard Abyss (player.abyssplayer.com). |
 | Subtitle tidak muncul di halaman film | Pastikan film terdaftar di katalog dulu, lalu cek **Admin → Subtitle**: bahasa/offset bisa dikoreksi & "pasang ulang ke player" di sana. |
@@ -190,3 +203,7 @@ rute Render juga ditinggalkan — wajib kartu + IP-nya diblokir CDN.)
 - **Fix subtitle 403** (Sep 2026) — login+PUT Abyss kini via curl + UA
   browser; bahasa subtitle asli ikut terdaftar di situs; CMS menambah
   pengaturan Sinkron (offset ± detik) + koreksi bahasa.
+- **Fix disk penuh** (Okt 2026) — sisa film lama dibersihkan otomatis
+  di awal run + file lokal dihapus segera setelah upload Abyss sukses
+  (film 2,4 GB ditolak karena sisa disk tinggal 1 GB — gejala "tidak
+  cukup" hilang total).

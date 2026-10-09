@@ -12,12 +12,6 @@
 #  + kuota Codespaces 60 jam mesin/bln (auto-stop tiap film).
 #  Repo PUBLIC = menit Actions UNLIMITED gratis.
 #
-#  v1.2 — KEBERSIHAN DISK (codespace persisten!): film .mp4 TIDAK lagi
-#  menumpuk. (a) Sisa film dari run sebelumnya dihapus otomatis saat
-#  pipeline mulai; (b) setelah upload ke Abyss BERHASIL, file lokal
-#  langsung dihapus — register/subtitle hanya butuh metadata (slug,
-#  size, sub_text), bukan file. Disk Codespace selalu bersih antar-film.
-#
 #  ENV (dari workflow_dispatch inputs + secrets):
 #    ZS_TITLE    (wajib) kata kunci pencarian judul
 #    ZS_PICK     indeks hasil pencarian (default "0")
@@ -28,6 +22,7 @@
 #    ZS_TOKEN    token register dari Admin → Server 3 (opsional)
 #    ABYSS_KEY / ABYSS_EMAIL / ABYSS_PASSWORD  (repo secrets)
 # =====================================================================
+import glob
 import json
 import os
 import re
@@ -459,35 +454,36 @@ def fail(msg):
     sys.exit(1)
 
 
-def clean_old_media(min_bytes=50 * 1024 * 1024):
-    """Hapus sisa video pipeline sebelumnya dari folder kerja.
-
-    Disk Codespace PERSISTEN antar-run: tanpa pembersihan ini, setiap film
-    yang diunduh menumpuk sampai 'Disk tidak cukup' pada run berikutnya.
-    Hanya file media besar (>50 MB) yang dihapus — file kecil/proyek aman.
-    Return (jumlah_file, total_byte) yang dikembalikan.
-    """
-    exts = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts")
-    n = total = 0
+def cleanup_workspace(keep=None):
+    """Hapus sisa video dari run sebelumnya — disk Codespace PERSISTEN
+    (Codespace di-stop tiap selesai, bukan dihapus) jadi film lama yang
+    tak pernah terhapus akan menumpuk sampai disk penuh dan run baru
+    ditolak "Disk tidak cukup". File yang jadi target run ini (keep)
+    DIPERTAHANKAN agar unduhan setengah-jadi bisa dilanjutkan (resume)
+    dan film yang sudah lengkap bisa dipakai ulang tanpa unduh ulang."""
+    pats = ["*.mp4", "*.mkv", "*.webm", "*.ts", "*.avi", "*.mov",
+            "*.flv", "*.m4v", "*.part", "*.tmp"]
+    seen, freed = set(), 0
+    for pat in pats:
+        for f in glob.glob(pat):
+            fa = os.path.abspath(f)
+            if fa in seen or (keep and fa == os.path.abspath(keep)):
+                continue
+            seen.add(fa)
+            try:
+                sz = os.path.getsize(fa)
+                os.remove(fa)
+                freed += sz
+                say(f"  🧹 hapus sisa lama: {os.path.basename(fa)} "
+                    f"({sz/1e6:.0f} MB)")
+            except OSError:
+                pass
+    # hygiene: file parameter run lama (berisi kredensial) kalau ada
     try:
-        names = os.listdir(".")
+        os.remove("/tmp/zs-params.json")
     except OSError:
-        return 0, 0
-    for name in names:
-        try:
-            if not os.path.isfile(name):
-                continue
-            if not name.lower().endswith(exts):
-                continue
-            sz = os.path.getsize(name)
-            if sz < min_bytes:
-                continue
-            os.remove(name)
-            n += 1
-            total += sz
-        except OSError:
-            pass
-    return n, total
+        pass
+    return freed
 
 
 def main():
@@ -500,16 +496,6 @@ def main():
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")
     summary_line(f"# ZS Download — {TITLE}")
     summary_line(f"- IP runner: `{egress}`")
-
-    # 0. bersihkan sisa film run sebelumnya — disk Codespace persisten,
-    #    tanpa ini file lama menumpuk sampai 'Disk tidak cukup'.
-    n_old, b_old = clean_old_media()
-    if n_old:
-        say(f"🧹 Bersih-bersih: {n_old} file film lama dihapus, "
-            f"{b_old/1e9:.2f} GB dikembalikan ke disk.")
-        summary_line(f"- Bersih-bersih: {n_old} file lama ({b_old/1e9:.2f} GB)")
-        st0 = shutil.disk_usage(".")
-        say(f"   Disk kini bebas: {st0.free/1e9:.1f} GB")
 
     # 1. cari judul
     results = mb_search(TITLE)
@@ -567,13 +553,21 @@ def main():
     say(f"\nFile tujuan: {FILE}  (kualitas {res}p, "
         f"{int(stream.get('size') or 0)/1e6:.0f} MB)")
 
-    # ruang disk runner (SETELAH bersih-bersih otomatis di atas)
+    # ruang disk Codespace — bersihkan sisa film run sebelumnya DULU
+    # (disk Codespace persisten antar-run; tanpa ini film lama menumpuk
+    # sampai cek "Disk tidak cukup" menolak film baru)
+    freed = cleanup_workspace(keep=FILE)
+    if freed:
+        say(f"  🧹 total {freed/1e9:.2f} GB dibebaskan dari sisa run "
+            "sebelumnya")
+        summary_line(f"- Disk: 🧹 {freed/1e9:.2f} GB sisa lama "
+                     "dibersihkan otomatis")
     st_disk = shutil.disk_usage(".")
     need = int(stream.get("size") or 0) * 1.15
     if need > st_disk.free:
-        fail(f"Disk tidak cukup (butuh {need/1e9:.1f} GB, sisa "
-             f"{st_disk.free/1e9:.1f} GB — sisa film lama sudah dibersihkan "
-             "otomatis) — pilih resolusi lebih rendah (mis. 720).")
+        fail(f"Disk Codespace tidak cukup (butuh {need/1e9:.1f} GB, "
+             f"sisa {st_disk.free/1e9:.1f} GB setelah sisa lama "
+             "dibersihkan) — pilih resolusi lebih rendah.")
 
     # 3. unduh video
     ok = mb_smart_download(DOMAIN, DP, se, ep, res, FILE)
@@ -642,20 +636,21 @@ def main():
     summary_line(f"- Slug Abyss: `{slug}`")
     summary_line(f"- Player: {up.get('urlIframe', '')}")
 
-    # 5b. HAPUS FILE LOKAL — film sudah aman di Abyss. Register ke situs
-    #     & pemasangan subtitle hanya butuh metadata (slug, size, sub_text),
-    #     bukan file lokal. Disk Codespace langsung dikembalikan supaya
-    #     run berikutnya tidak kehabisan ruang (disk Codespace persisten).
+    # 5.5 BEBASKAN DISK SEGERA: film sudah aman di Abyss (slug keluar =
+    # upload diterima; langkah berikutnya — tunggu transcode, register,
+    # pasang subtitle — hanya butuh metadata/teks di memori, BUKAN file
+    # lokal). File lokal dihapus SEKARANG supaya storage Codespace tidak
+    # pernah menumpuk (permintaan pemilik: hapus begitu upload selesai).
+    # Kalau nanti register diulang dengan judul sama, film akan diunduh
+    # ulang — itu harga murah demi disk yang selalu ramping.
     try:
         os.remove(FILE)
-        st5 = shutil.disk_usage(".")
-        say(f"🗑 File lokal dihapus ({size/1e9:.2f} GB dikembalikan) — "
-            f"disk bebas {st5.free/1e9:.1f} GB untuk film berikutnya.")
-        summary_line(f"- Disk: file lokal dihapus ({size/1e9:.2f} GB) "
-                     "setelah upload Abyss")
+        say(f"\n🧹 File lokal dihapus ({size/1e9:.2f} GB dibebaskan) — "
+            "film aman di Abyss.")
+        summary_line(f"- Disk: 🧹 file lokal dihapus segera setelah upload "
+                     f"({size/1e9:.2f} GB) — storage Codespace tetap ramping")
     except OSError as e:
-        say("⚠ Gagal menghapus file lokal:", repr(e)[:100],
-            "(tidak fatal — akan dibersihkan di run berikutnya)")
+        say("Gagal menghapus file lokal:", repr(e)[:100])
 
     # 6. tunggu transcode ready (maks 15 menit)
     say("\nMenunggu Abyss men-transcode (maks 15 menit)…")
@@ -747,6 +742,7 @@ def main():
     say("\n" + "=" * 58)
     if reg_ok:
         say(f"SUKSES! Judul TERSEDIA di Server 3 situs kamu.")
+        say(f"Disk Codespace sudah bersih (file lokal dihapus post-upload).")
         if sub_text:
             say(f"Subtitle {sub_lan or 'Indonesia'} aktif: buka halaman film → "
                 "Server 3 → CC. (Track native Abyss: "
