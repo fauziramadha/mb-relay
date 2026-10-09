@@ -100,6 +100,12 @@ ke repo = Codespace otomatis memakainya saat dibangunkan berikutnya.
    - **subtitle** — `in_id` (Indonesia) / `ms` (Melayu) / `en` / `none`
    - **token** — token register dari **Admin → Server 3** situs
      (isi agar film otomatis masuk katalog; kosong = upload Abyss saja)
+   - **slug_lama** — slug Abyss dari run sebelumnya (mis.
+     `SGZKkyR9C`) — isi **hanya** bila film sudah pernah terupload
+     tapi register waktu itu belum jalan (lupa token / error).
+     Mode ini **TANPA unduh & upload ulang** — register pakai slug
+     lama, kualitas/size terisi otomatis dari Abyss, subtitle tetap
+     diambil. Cuma ± 3-5 menit.
 2. Tonton log berjalan (log pipeline Codespace di-stream ke log Actions).
 3. Selesai (film 2 GB ± 25-40 menit; film kecil ± 15-20 menit) → **Codespace
    dimatikan otomatis** — kuota Codespaces tidak terbakar idle.
@@ -165,7 +171,8 @@ pipeline ini memang on-demand (jalan hanya saat kamu meminta film).
 | `Codespace mb-relay tidak ditemukan` | Codespace terhapus. Buka repo → tombol **Code** → tab **Codespaces** → **Create codespace on main**. Workflow otomatis menemukan Codespace repo yang terakhir dipakai — tidak ada nama yang di-hardcode. |
 | `Relay tidak menjawab /healthz` | Port kembali private setelah tidur → `public_port.sh` menyembuhkan otomatis (± 1-3 mnt). Kalau lebih dari 5 menit: github.com/codespaces → **Restart**, lalu run ulang. |
 | `426` di log unduhan | Kamu menjalankan versi lama (runner mengunduh langsung). Pastikan repo tersinkron (zs-dl.yml terbaru = runner hanya orkestrator). |
-| Film tidak muncul di situs padahal run SUKSES | Input **token** kosong — film tetap ada di Abyss (slug tertera di log). Daftarkan manual: Admin → Server 3 → tempel slug, ATAU run ulang workflow dengan judul sama + token. |
+| Film tidak muncul di situs padahal run SUKSES | Input **token** kosong — film tetap ada di Abyss (slug tertera di log). Daftarkan manual: Admin → Server 3 → tempel slug, ATAU run ulang workflow dengan judul sama + token + **slug_lama** (register-saja, cepat, tanpa unduh ulang). |
+| `HTTP 503` di log awal (get-domain / play / caption) | API BFF MovieBox **intermiten 503** (gangguan di sisi mereka, acak per-request). v1.2.3: pipeline otomatis retry 6× tiap 5 dtk — hampir pasti lolos. Kalau masih gagal 6× berarti sumber benar-benar down → tunggu beberapa jam lalu run ulang. |
 | Transcode Abyss > 15 menit | Tidak masalah — register tetap dilakukan; status bisa dicek di dashboard Abyss (player.abyssplayer.com). |
 | Subtitle tidak muncul di halaman film | Pastikan film terdaftar di katalog dulu, lalu cek **Admin → Subtitle**: bahasa/offset bisa dikoreksi & "pasang ulang ke player" di sana. |
 | `subtitles 403` / `HTTP 403` saat pasang subtitle | Sudah diperbaiki di versi sekarang (curl + UA browser). Kalau masih muncul: Codespace belum menarik kode terbaru → Restart Codespace sekali lalu run ulang. |
@@ -207,3 +214,14 @@ rute Render juga ditinggalkan — wajib kartu + IP-nya diblokir CDN.)
   di awal run + file lokal dihapus segera setelah upload Abyss sukses
   (film 2,4 GB ditolak karena sisa disk tinggal 1 GB — gejala "tidak
   cukup" hilang total).
+- **v1.2.2** (9 Okt 2026) — wake-step re-POST /start tiap 60 dtk saat
+  Codespace masih Shutdown/ShuttingDown (race start yang ditelan →
+  polling 7 menit sia-sia → run gagal).
+- **v1.2.3** (9 Okt 2026) — dua perbaikan dari kasus nyata hari itu:
+  (1) **retry 503** — BFF MovieBox intermiten 503 acak membuat run 24
+  mati di `get-domain` padahal run 23 sukses 38 menit sebelumnya;
+  sekarang `mb_http` ulang otomatis 6×/5 dtk (502/503/504/429).
+  (2) **mode register-saja** via input `slug_lama` — film yang sudah
+  terupload tapi belum masuk katalog (lupa token) tinggal register
+  ulang tanpa unduh 2,4 GB lagi; register juga kini retry saat Abyss
+  masih mem-proses (jawaban 202).

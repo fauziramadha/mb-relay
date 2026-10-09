@@ -37,6 +37,10 @@ on:
         description: "TOKEN dari Admin → Server 3 (opsional; isi agar otomatis register ke situs)"
         required: false
         default: ""
+      slug_lama:
+        description: "Slug Abyss run sebelumnya, mis. SGZKkyR9C (opsional; isi = register-saja TANPA unduh/upload ulang)"
+        required: false
+        default: ""
 
 concurrency:
   group: zs-dl
@@ -61,6 +65,7 @@ jobs:
           I_KUALITAS: ${{ inputs.kualitas }}
           I_SUBTITLE: ${{ inputs.subtitle }}
           I_TOKEN: ${{ inputs.token }}
+          I_SLUG_LAMA: ${{ inputs.slug_lama }}
           ABYSS_KEY: ${{ secrets.ABYSS_KEY }}
           ABYSS_EMAIL: ${{ secrets.ABYSS_EMAIL }}
           ABYSS_PASSWORD: ${{ secrets.ABYSS_PASSWORD }}
@@ -75,6 +80,7 @@ jobs:
               "quality": os.environ["I_KUALITAS"] or "auto",
               "sub": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
+              "reuse_slug": os.environ["I_SLUG_LAMA"] or "",
               "abyss_key": os.environ["ABYSS_KEY"],
               "abyss_email": os.environ["ABYSS_EMAIL"],
               "abyss_password": os.environ["ABYSS_PASSWORD"],

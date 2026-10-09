@@ -22,6 +22,14 @@
 #    ZS_TOKEN    token register dari Admin → Server 3 (opsional)
 #    ABYSS_KEY / ABYSS_EMAIL / ABYSS_PASSWORD  (repo secrets)
 # =====================================================================
+#
+# v1.2.3 (9 Okt 2026):
+#   - mb_http RETRY 6x/5dtk utk 502/503/504/429 — BFF MovieBox
+#     intermiten 503 (terukur 40-60% request acak; run 24 mati di
+#     get-domain karena belum ada retry).
+#   - MODE REGISTER-SAJA via input slug_lama: film sudah ada di Abyss
+#     (mis. run lalu lupa isi token) → register TANPA unduh/upload.
+#   - register retry saat jawaban "still processing" (202).
 import glob
 import json
 import os
@@ -47,6 +55,7 @@ EPISODE = int(os.environ.get("ZS_EP") or 1)
 QUALITY = (os.environ.get("ZS_QUALITY") or "auto").strip().lower()
 SUB_LANG = (os.environ.get("ZS_SUB") or "in_id").strip().lower()
 TOKEN = (os.environ.get("ZS_TOKEN") or "").strip()
+REUSE_SLUG = (os.environ.get("ZS_REUSE_SLUG") or "").strip()
 ABYSS_KEY = os.environ.get("ABYSS_KEY", "")
 ABYSS_EMAIL = os.environ.get("ABYSS_EMAIL", "")
 ABYSS_PASSWORD = os.environ.get("ABYSS_PASSWORD", "")
@@ -63,6 +72,7 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
     QUALITY = str(_p.get("quality") or QUALITY).strip().lower()
     SUB_LANG = str(_p.get("sub") or SUB_LANG).strip().lower()
     TOKEN = str(_p.get("token") or TOKEN).strip()
+    REUSE_SLUG = str(_p.get("reuse_slug") or REUSE_SLUG).strip()
     ABYSS_KEY = _p.get("abyss_key") or ABYSS_KEY
     ABYSS_EMAIL = _p.get("abyss_email") or ABYSS_EMAIL
     ABYSS_PASSWORD = _p.get("abyss_password") or ABYSS_PASSWORD
@@ -94,8 +104,23 @@ def mb_http(url, referer=None, hdrs=None, timeout=40):
         h["Referer"] = referer
     if hdrs:
         h.update(hdrs)
-    return urllib.request.urlopen(
-        urllib.request.Request(url, headers=h), timeout=timeout)
+    # RETRY transient (v1.2.3): BFF MovieBox intermiten 503 — pool
+    # upstream flaky (terukur 9 Okt 2026: 40-60% request kena 503 acak,
+    # endpoint HTML sehat; run 24 mati persis di get-domain). Ulang
+    # singkat menembus hampir pasti; error lain (404/403) tetap raise.
+    last = None
+    for _attempt in range(6):
+        try:
+            return urllib.request.urlopen(
+                urllib.request.Request(url, headers=h), timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (502, 503, 504, 429):
+                raise
+            last = e
+            say(f"  ⚠ HTTP {e.code} dari API MovieBox "
+                f"(percobaan {_attempt + 1}/6) — ulang 5 dtk…")
+            time.sleep(5)
+    raise last
 
 
 def mb_ip():
@@ -553,31 +578,46 @@ def main():
     say(f"\nFile tujuan: {FILE}  (kualitas {res}p, "
         f"{int(stream.get('size') or 0)/1e6:.0f} MB)")
 
-    # ruang disk Codespace — bersihkan sisa film run sebelumnya DULU
-    # (disk Codespace persisten antar-run; tanpa ini film lama menumpuk
-    # sampai cek "Disk tidak cukup" menolak film baru)
-    freed = cleanup_workspace(keep=FILE)
-    if freed:
-        say(f"  🧹 total {freed/1e9:.2f} GB dibebaskan dari sisa run "
-            "sebelumnya")
-        summary_line(f"- Disk: 🧹 {freed/1e9:.2f} GB sisa lama "
-                     "dibersihkan otomatis")
-    st_disk = shutil.disk_usage(".")
-    need = int(stream.get("size") or 0) * 1.15
-    if need > st_disk.free:
-        fail(f"Disk Codespace tidak cukup (butuh {need/1e9:.1f} GB, "
-             f"sisa {st_disk.free/1e9:.1f} GB setelah sisa lama "
-             "dibersihkan) — pilih resolusi lebih rendah.")
+    # MODE REGISTER-SAJA (v1.2.3): input slug_lama terisi → film SUDAH
+    # ada di Abyss dari run sebelumnya (mis. lupa isi token) → lewati
+    # cek disk + unduh; register pakai slug lama. Subtitle tetap diambil.
+    reuse = REUSE_SLUG.strip()
+    if reuse:
+        slug = reuse
+        size = int(stream.get("size") or 0)
+        up = {"slug": slug,
+              "urlIframe": f"https://player.abyssplayer.com/{slug}"}
+        say(f"\n🔁 MODE REGISTER-SAJA — slug lama: {slug}")
+        say("   unduh + upload DILEWATI: film sudah aman di Abyss dari")
+        say("   run sebelumnya. Kualitas/size akan diisi otomatis dari")
+        say("   Abyss saat register. Subtitle resmi tetap diambil.")
+        summary_line(f"- Mode: register ulang slug `{slug}` (tanpa unduh)")
+    else:
+        # ruang disk Codespace — bersihkan sisa film run sebelumnya DULU
+        # (disk Codespace persisten antar-run; tanpa ini film lama menumpuk
+        # sampai cek "Disk tidak cukup" menolak film baru)
+        freed = cleanup_workspace(keep=FILE)
+        if freed:
+            say(f"  🧹 total {freed/1e9:.2f} GB dibebaskan dari sisa run "
+                "sebelumnya")
+            summary_line(f"- Disk: 🧹 {freed/1e9:.2f} GB sisa lama "
+                         "dibersihkan otomatis")
+        st_disk = shutil.disk_usage(".")
+        need = int(stream.get("size") or 0) * 1.15
+        if need > st_disk.free:
+            fail(f"Disk Codespace tidak cukup (butuh {need/1e9:.1f} GB, "
+                 f"sisa {st_disk.free/1e9:.1f} GB setelah sisa lama "
+                 "dibersihkan) — pilih resolusi lebih rendah.")
 
-    # 3. unduh video
-    ok = mb_smart_download(DOMAIN, DP, se, ep, res, FILE)
-    if not ok:
-        fail("Unduhan gagal — lihat jawaban CDN di log. Kalau 426/427, "
-             "jaringan runner GitHub juga diblokir (kabar buruk — hubungi "
-             "Super Z untuk strategi lain).")
-    size = os.path.getsize(FILE)
-    say(f"\nVideo siap: {FILE} ({size/1e9:.2f} GB)")
-    summary_line(f"- File: `{FILE}` ({size/1e9:.2f} GB, {res}p)")
+        # 3. unduh video
+        ok = mb_smart_download(DOMAIN, DP, se, ep, res, FILE)
+        if not ok:
+            fail("Unduhan gagal — lihat jawaban CDN di log. Kalau 426/427, "
+                 "jaringan runner GitHub juga diblokir (kabar buruk — "
+                 "hubungi Super Z untuk strategi lain).")
+        size = os.path.getsize(FILE)
+        say(f"\nVideo siap: {FILE} ({size/1e9:.2f} GB)")
+        summary_line(f"- File: `{FILE}` ({size/1e9:.2f} GB, {res}p)")
 
     # 4. subtitle resmi MovieBox (best-effort)
     sub_text, sub_lan = None, None
@@ -603,54 +643,59 @@ def main():
     else:
         say("Unduh subtitle dimatikan.")
 
-    # 5. upload ke Abyss (curl multipart, 3x percobaan)
-    if not os.path.exists(FILE):
-        fail("File hilang setelah unduh — error aneh, cek log.")
-    say(f"\nMengunggah {FILE} ({size/1e9:.2f} GB) ke Abyss…")
-    up = None
-    for attempt in range(3):
-        cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit", "2048",
-               "--speed-time", "120",
-               "-F", f"file=@{FILE};type=video/mp4",
-               f"https://up.abyss.to/{ABYSS_KEY}"]
-        try:
-            p = subprocess.run(cmd, capture_output=True, timeout=7300)
-        except subprocess.TimeoutExpired:
-            p = None
-        if p is not None:
-            try:
-                up = json.loads(p.stdout or b"{}")
-            except Exception:
-                up = None
-        if isinstance(up, dict) and up.get("status"):
-            break
-        say(f"  percobaan {attempt + 1}/3 gagal: "
-            f"exit {p.returncode if p else 'timeout'} "
-            f"{((p.stderr or b'')[:150]) if p else b''}")
+    # 5. upload ke Abyss (curl multipart, 3x percobaan) — DILEWATI bila
+    #    mode register-saja (slug lama: film sudah ada di Abyss)
+    if reuse:
+        say("(upload Abyss + hapus file lokal dilewati — mode register-saja)")
+    else:
+        if not os.path.exists(FILE):
+            fail("File hilang setelah unduh — error aneh, cek log.")
+        say(f"\nMengunggah {FILE} ({size/1e9:.2f} GB) ke Abyss…")
         up = None
-        time.sleep(10)
-    if not (isinstance(up, dict) and up.get("status")):
-        fail(f"Upload Abyss ditolak: {up or 'tidak ada jawaban JSON'}")
-    slug = up["slug"]
-    say("Slug Abyss:", slug, "→", up.get("urlIframe"))
-    summary_line(f"- Slug Abyss: `{slug}`")
-    summary_line(f"- Player: {up.get('urlIframe', '')}")
+        for attempt in range(3):
+            cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
+                   "2048", "--speed-time", "120",
+                   "-F", f"file=@{FILE};type=video/mp4",
+                   f"https://up.abyss.to/{ABYSS_KEY}"]
+            try:
+                p = subprocess.run(cmd, capture_output=True, timeout=7300)
+            except subprocess.TimeoutExpired:
+                p = None
+            if p is not None:
+                try:
+                    up = json.loads(p.stdout or b"{}")
+                except Exception:
+                    up = None
+            if isinstance(up, dict) and up.get("status"):
+                break
+            say(f"  percobaan {attempt + 1}/3 gagal: "
+                f"exit {p.returncode if p else 'timeout'} "
+                f"{((p.stderr or b'')[:150]) if p else b''}")
+            up = None
+            time.sleep(10)
+        if not (isinstance(up, dict) and up.get("status")):
+            fail(f"Upload Abyss ditolak: {up or 'tidak ada jawaban JSON'}")
+        slug = up["slug"]
+        say("Slug Abyss:", slug, "→", up.get("urlIframe"))
+        summary_line(f"- Slug Abyss: `{slug}`")
+        summary_line(f"- Player: {up.get('urlIframe', '')}")
 
-    # 5.5 BEBASKAN DISK SEGERA: film sudah aman di Abyss (slug keluar =
-    # upload diterima; langkah berikutnya — tunggu transcode, register,
-    # pasang subtitle — hanya butuh metadata/teks di memori, BUKAN file
-    # lokal). File lokal dihapus SEKARANG supaya storage Codespace tidak
-    # pernah menumpuk (permintaan pemilik: hapus begitu upload selesai).
-    # Kalau nanti register diulang dengan judul sama, film akan diunduh
-    # ulang — itu harga murah demi disk yang selalu ramping.
-    try:
-        os.remove(FILE)
-        say(f"\n🧹 File lokal dihapus ({size/1e9:.2f} GB dibebaskan) — "
-            "film aman di Abyss.")
-        summary_line(f"- Disk: 🧹 file lokal dihapus segera setelah upload "
-                     f"({size/1e9:.2f} GB) — storage Codespace tetap ramping")
-    except OSError as e:
-        say("Gagal menghapus file lokal:", repr(e)[:100])
+        # 5.5 BEBASKAN DISK SEGERA: film sudah aman di Abyss (slug keluar =
+        # upload diterima; langkah berikutnya — tunggu transcode, register,
+        # pasang subtitle — hanya butuh metadata/teks di memori, BUKAN file
+        # lokal). File lokal dihapus SEKARANG supaya storage Codespace tidak
+        # pernah menumpuk (permintaan pemilik: hapus begitu upload selesai).
+        # Register ulang di kemudian hari: isi input slug_lama — TANPA
+        # mengunduh ulang (v1.2.3).
+        try:
+            os.remove(FILE)
+            say(f"\n🧹 File lokal dihapus ({size/1e9:.2f} GB dibebaskan) — "
+                "film aman di Abyss.")
+            summary_line(f"- Disk: 🧹 file lokal dihapus segera setelah "
+                         f"upload ({size/1e9:.2f} GB) — storage Codespace "
+                         "tetap ramping")
+        except OSError as e:
+            say("Gagal menghapus file lokal:", repr(e)[:100])
 
     # 6. tunggu transcode ready (maks 15 menit)
     say("\nMenunggu Abyss men-transcode (maks 15 menit)…")
@@ -681,16 +726,30 @@ def main():
             subs = [{"lang": sub_lan or "Indonesia",
                      "filename": f"{lang_slug(sub_lan)}.srt",
                      "content": sub_text, "srt": True}]
-        body = json.dumps({"slug": slug, "quality": f"{res}p",
-                           "size": size, "subs": subs}).encode()
+        reg_body = {"slug": slug, "subs": subs}
+        if not reuse:
+            # mode unduh: kualitas/size dari unduhan nyata. Mode
+            # register-saja: dibiarkan kosong → diisi otomatis dari
+            # Abyss saat register (lebih otoritatatif).
+            reg_body["quality"] = f"{res}p"
+            reg_body["size"] = size
+        body = json.dumps(reg_body).encode()
         req = urllib.request.Request(
             f"{REGISTER}?token={urllib.parse.quote(TOKEN)}", data=body,
             headers={"Content-Type": "application/json",
                      "User-Agent": "zs-actions/1.0"})
-        try:
-            reg = json.load(urllib.request.urlopen(req, timeout=120))
-        except Exception as e:
-            reg = {"ok": False, "error": repr(e)[:200]}
+        # retry bila Abyss masih mem-proses (jawaban 202/"still
+        # processing" — v1.2.3): tunggu 60 dtk lalu ulang, maks 4x
+        for reg_try in range(4):
+            try:
+                reg = json.load(urllib.request.urlopen(req, timeout=120))
+            except Exception as e:
+                reg = {"ok": False, "error": repr(e)[:200]}
+            if reg.get("ok") or not reg.get("retry"):
+                break
+            say(f"  Abyss masih mem-proses (jawaban: {reg.get('error')}) "
+                f"— tunggu 60 dtk, ulang register ({reg_try + 1}/4)…")
+            time.sleep(60)
         say("Jawaban situs:", reg)
         reg_ok = bool(reg.get("ok"))
         if reg_ok:
@@ -701,9 +760,10 @@ def main():
         say("\nTOKEN register tidak diisi — film SUDAH terupload ke Abyss.")
         say("Slug:", slug)
         say("Untuk memasukkan ke katalog situs (Server 3): generate token di")
-        say("Admin → Server 3, lalu jalankan ulang workflow dengan judul sama")
-        say("(unduh ulang ~beberapa menit saja), ATAU daftarkan slug manual")
-        say("di form Admin. Player:", str(up.get("urlIframe") or ""))
+        say("Admin → Server 3, lalu jalankan ulang workflow dengan judul")
+        say("sama + isi input slug_lama dengan slug di atas (CEPAT —")
+        say("tanpa unduh ulang), ATAU daftarkan slug manual di form Admin.")
+        say("Player:", str(up.get("urlIframe") or ""))
         summary_line("- Register: ⏭ dilewati (token kosong) — daftarkan slug "
                      "via Admin → Server 3")
 
