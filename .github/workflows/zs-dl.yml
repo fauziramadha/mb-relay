@@ -25,6 +25,10 @@ on:
         description: "Episode ke berapa (SERIAL saja; film biarkan 1)"
         required: false
         default: "1"
+      episodes:
+        description: "BULK series: daftar/rentang episode, mis. 1-100 / 1,3,5-8 (kosong = mode tunggal input episode). Di-chunk otomatis ±2 jam per run"
+        required: false
+        default: ""
       kualitas:
         description: "auto / 1080 / 720 / 360 (default auto = tertinggi gratis)"
         required: false
@@ -50,6 +54,11 @@ jobs:
   unduh:
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    # Task 92: actions:write → runner bisa men-dispatch chunk berikutnya
+    # via GITHUB_TOKEN (fallback bila CODES_PAT gagal); contents:read utk checkout
+    permissions:
+      actions: write
+      contents: read
     env:
       CODES_PAT: ${{ secrets.CODES_PAT }}
       ZS_EXEC_KEY: ${{ secrets.ZS_EXEC_KEY }}
@@ -62,6 +71,7 @@ jobs:
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
           I_EPISODE: ${{ inputs.episode }}
+          I_EPISODES: ${{ inputs.episodes }}
           I_KUALITAS: ${{ inputs.kualitas }}
           I_SUBTITLE: ${{ inputs.subtitle }}
           I_TOKEN: ${{ inputs.token }}
@@ -77,6 +87,8 @@ jobs:
               "pick": int(os.environ["I_PICK"] or 0),
               "se": int(os.environ["I_MUSIM"] or 1),
               "ep": int(os.environ["I_EPISODE"] or 1),
+              "episodes": os.environ["I_EPISODES"] or "",
+              "budget_min": 95,
               "quality": os.environ["I_KUALITAS"] or "auto",
               "sub": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
@@ -88,7 +100,8 @@ jobs:
           path = os.path.join(os.environ["RUNNER_TEMP"], "zs-params.json")
           with open(path, "w") as f:
               json.dump(p, f)
-          print("params siap — judul:", p["title"], "| kualitas:", p["quality"])
+          mode = f"BULK {p['episodes']}" if p["episodes"] else f"tunggal S{p['se']}E{p['ep']}"
+          print(f"params siap — judul: {p['title']} | mode: {mode} | kualitas: {p['quality']}")
           PY
 
       - name: Cari Codespace relay mb-relay
@@ -187,9 +200,10 @@ jobs:
           PY
 
       - name: Jalankan pipeline DI DALAM Codespace (via relay /exec)
+        id: monitor
         run: |
           python3 - <<'PY'
-          import base64, json, os, time, urllib.request
+          import base64, json, os, re, time, urllib.request
 
           BASE = os.environ["RELAY_URL"]
           KEY = os.environ["ZS_EXEC_KEY"]
@@ -237,14 +251,17 @@ jobs:
           print("pekerjaan dimulai:", r)
           assert r.get("started"), f"jobstart gagal: {r}"
 
-          # 3. pantau log sampai selesai (maks 2 jam)
+          # 3. pantau log sampai selesai (maks 2 jam); log penuh ditampung
+          #    untuk deteksi marker sisa episode bulk (Task 92)
           off, deadline, exit_code = 0, time.time() + 7200, None
+          full_log = ""
           while time.time() < deadline:
               j = get(f"/joblog?from={off}")
               if j.get("size", 0) > off:
                   chunk = base64.b64decode(j.get("b64", "")) \
                       .decode("utf-8", "replace")
                   print(chunk, end="", flush=True)
+                  full_log += chunk
                   off = j["size"]
               if j.get("done") and not j.get("alive"):
                   exit_code = j.get("exit")
@@ -254,13 +271,88 @@ jobs:
               raise SystemExit("pekerjaan tidak selesai dalam 2 jam / "
                                "log terputus")
           print(f"\n== exit code codespace: {exit_code} ==")
+
+          # 3b. Task 92 — sisa episode bulk → step output utk antre-chunk
+          remain = ""
+          m = re.search(r"ZS_BULK_REMAIN:([0-9,\-]+)", full_log)
+          if m:
+              remain = m.group(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"remain={remain}\n")
+          print(f"== sisa episode chunk berikutnya: {remain or '(tidak ada)'} ==")
+
           if exit_code != 0:
               raise SystemExit(f"pipeline gagal di codespace (exit {exit_code})")
           print("PIPELINE SELESAI ✔")
           PY
 
+      - name: Antre chunk berikutnya bila ada sisa episode (bulk)
+        # Task 92 — dispatch ulang workflow ini dengan sisa spec episode.
+        # CODES_PAT (PAT user) utama; GITHUB_TOKEN (actions:write) fallback.
+        if: steps.monitor.outputs.remain != ''
+        env:
+          REMAIN: ${{ steps.monitor.outputs.remain }}
+          I_JUDUL: ${{ inputs.judul }}
+          I_PICK: ${{ inputs.pilihan }}
+          I_MUSIM: ${{ inputs.musim }}
+          I_KUALITAS: ${{ inputs.kualitas }}
+          I_SUBTITLE: ${{ inputs.subtitle }}
+          I_TOKEN: ${{ inputs.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+
+          REPO = "fauziramadha/mb-relay"
+          inputs = {
+              "judul": os.environ["I_JUDUL"],
+              "pilihan": os.environ["I_PICK"] or "0",
+              "musim": os.environ["I_MUSIM"] or "1",
+              "episode": "1",
+              "episodes": os.environ["REMAIN"],
+              "kualitas": os.environ["I_KUALITAS"] or "auto",
+              "subtitle": os.environ["I_SUBTITLE"] or "in_id",
+              "token": os.environ["I_TOKEN"] or "",
+              "slug_lama": "",
+          }
+          body = json.dumps({"ref": "main", "inputs": inputs}).encode()
+
+          def dispatch(token, label):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/actions/workflows/"
+                  "zs-dl.yml/dispatches",
+                  data=body, method="POST",
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              try:
+                  urllib.request.urlopen(req, timeout=30)
+                  return True
+              except urllib.error.HTTPError as e:
+                  print(f"  dispatch via {label}: HTTP {e.code} "
+                        f"{e.read()[:150]}")
+                  return False
+
+          ok = False
+          pat = os.environ.get("CODES_PAT")
+          if pat:
+              ok = dispatch(pat, "CODES_PAT")
+          if not ok and os.environ.get("GITHUB_TOKEN"):
+              ok = dispatch(os.environ["GITHUB_TOKEN"], "GITHUB_TOKEN")
+          if ok:
+              print("OK: chunk berikutnya DIANTREKAN — sisa episode: "
+                    + os.environ["REMAIN"])
+          else:
+              print("!! gagal auto-antre chunk berikutnya — jalankan MANUAL:")
+              print("   GitHub > fauziramadha/mb-relay > Actions > "
+                    "ZS Download > Run workflow dengan input:")
+              for k, v in inputs.items():
+                  print(f"     {k} = {v}")
+          PY
+
       - name: Matikan Codespace lagi (hemat kuota)
-        if: always()
+        # dilewati bila masih ada sisa episode bulk — codespace dibiarkan
+        # hidup supaya chunk berikutnya langsung jalan tanpa boot ulang
+        if: always() && steps.monitor.outputs.remain == ''
         run: |
           curl -s -o /dev/null -X POST \
             -H "Authorization: Bearer $CODES_PAT" \

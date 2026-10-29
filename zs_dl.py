@@ -16,14 +16,28 @@
 #    ZS_TITLE    (wajib) kata kunci pencarian judul
 #    ZS_PICK     indeks hasil pencarian (default "0")
 #    ZS_SE       musim, serial saja (default "1")
-#    ZS_EP       episode, serial saja (default "1")
+#    ZS_EP       episode, serial saja (default "1") — MODE TUNGGAL
+#    ZS_EPISODES BULK: spec episode, mis. "1-100" / "1,3,5-8" (Task 92);
+#                bila terisi maka mode bulk dipakai (TV saja) dan ZS_EP diabaikan
+#    ZS_BUDGET_MIN soft-budget menit per chunk (default 95) — bila terlampaui,
+#                sisa episode ditunda & marker ZS_BULK_REMAIN dicetak agar
+#                runner men-dispatch chunk berikutnya otomatis
 #    ZS_QUALITY  auto / 1080 / 720 / 360 (default "auto")
 #    ZS_SUB      in_id / ms / en / none (default "in_id")
-#    ZS_TOKEN    token register dari Admin → Server 3 (opsional)
+#    ZS_TOKEN    token register dari Admin → Server 3 (opsional; untuk bulk
+#                kirim token SCOPE-SERIES — dibuat tanpa episode, register
+#                mengirim "episode" per panggilan)
 #    ABYSS_KEY / ABYSS_EMAIL / ABYSS_PASSWORD  (repo secrets)
 # =====================================================================
 #
-# v1.2.3 (9 Okt 2026):
+# v1.3 (29 Okt 2026) — Task 92 MODE BULK:
+#   - sekali jalan utk banyak episode (unduh→upload→register per episode,
+#     gagal satu ≠ gagal semua; file lokal dihapus tiap episode)
+#   - budget chunk 95 mnt (runner GHA max ±2 j monitoring); sisa episode
+#     otomatis di-antrekan zs-dl.yml sebagai chunk baru (self-dispatch)
+#   - token scope-series: register per episode dengan body.episode
+#   - subtitle resmi MovieBox + CC Abyss native tetap per episode
+#
 #   - mb_http RETRY 6x/5dtk utk 502/503/504/429 — BFF MovieBox
 #     intermiten 503 (terukur 40-60% request acak; run 24 mati di
 #     get-domain karena belum ada retry).
@@ -52,6 +66,8 @@ TITLE = (os.environ.get("ZS_TITLE") or "").strip()
 PICK = int(os.environ.get("ZS_PICK") or 0)
 SEASON = int(os.environ.get("ZS_SE") or 1)
 EPISODE = int(os.environ.get("ZS_EP") or 1)
+EPISODES_SPEC = (os.environ.get("ZS_EPISODES") or "").strip()
+BUDGET_MIN = int(os.environ.get("ZS_BUDGET_MIN") or 0) or 95
 QUALITY = (os.environ.get("ZS_QUALITY") or "auto").strip().lower()
 SUB_LANG = (os.environ.get("ZS_SUB") or "in_id").strip().lower()
 TOKEN = (os.environ.get("ZS_TOKEN") or "").strip()
@@ -69,6 +85,8 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
     PICK = int(_p["pick"]) if _p.get("pick") is not None else PICK
     SEASON = int(_p["se"]) if _p.get("se") is not None else SEASON
     EPISODE = int(_p["ep"]) if _p.get("ep") is not None else EPISODE
+    EPISODES_SPEC = str(_p.get("episodes") or EPISODES_SPEC).strip()
+    BUDGET_MIN = int(_p["budget_min"]) if _p.get("budget_min") else BUDGET_MIN
     QUALITY = str(_p.get("quality") or QUALITY).strip().lower()
     SUB_LANG = str(_p.get("sub") or SUB_LANG).strip().lower()
     TOKEN = str(_p.get("token") or TOKEN).strip()
@@ -511,11 +529,285 @@ def cleanup_workspace(keep=None):
     return freed
 
 
+# ---------------- bulk (Task 92) ----------------
+ABYSS_JWT = None  # login sekali per batch (lazy)
+
+
+def parse_episode_spec(spec):
+    """'1-3,5,7-9' → [1,2,3,5,7,8,9]. Validasi 1..5000, maks 1500 nomor."""
+    out = set()
+    for part in str(spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        m = re.match(r"^(\d{1,4})(?:-(\d{1,4}))?$", part)
+        if not m:
+            raise ValueError(f"bagian spec tidak valid: '{part}'")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if a > b:
+            a, b = b, a
+        if a < 1 or b > 5000:
+            raise ValueError(f"episode harus 1-5000: '{part}'")
+        if b - a + 1 > 1500:
+            raise ValueError(f"rentang terlalu panjang: '{part}'")
+        out.update(range(a, b + 1))
+    if not out:
+        raise ValueError("spec kosong")
+    if len(out) > 1500:
+        raise ValueError("maksimal 1500 episode per batch")
+    return sorted(out)
+
+
+def build_episode_spec(eps):
+    """[1,2,3,5,7,8,9] → '1-3,5,7-9' (mirror compressEpisodes di CMS)."""
+    eps = sorted(set(int(e) for e in eps))
+    if not eps:
+        return ""
+    parts, start, prev = [], eps[0], eps[0]
+    for i in range(1, len(eps) + 1):
+        cur = eps[i] if i < len(eps) else None
+        if cur != prev + 1:
+            parts.append(str(start) if prev == start else f"{start}-{prev}")
+            start = cur
+        prev = cur
+    return ",".join(parts)
+
+
+def register_one(slug, ep, res, size, sub_text, sub_lan, is_tv, retries=4):
+    """Register SATU episode ke katalog situs. Body membawa 'episode' —
+    dipakai token scope-series; token per-episode mengabaikannya (aman).
+    Return dict jawaban situs; 'retry'=True → Abyss masih mem-proses."""
+    if not TOKEN:
+        return {"ok": True, "skip": "token-kosong"}
+    subs = []
+    if sub_text:
+        subs = [{"lang": sub_lan or "Indonesia",
+                 "filename": f"{lang_slug(sub_lan)}.srt",
+                 "content": sub_text, "srt": True}]
+    body = {"slug": slug, "subs": subs, "quality": f"{res}p", "size": size}
+    if is_tv:
+        body["episode"] = ep
+    req = urllib.request.Request(
+        f"{REGISTER}?token={urllib.parse.quote(TOKEN)}",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "zs-actions/1.0"})
+    reg = {}
+    for attempt in range(retries):
+        try:
+            reg = json.load(urllib.request.urlopen(req, timeout=120))
+        except Exception as e:
+            reg = {"ok": False, "error": repr(e)[:200]}
+        if reg.get("ok") or not reg.get("retry"):
+            return reg
+        say(f"  Abyss masih mem-proses — tunggu 60 dtk, ulang register "
+            f"({attempt + 1}/{retries})…")
+        time.sleep(60)
+    return reg
+
+
+def process_episode(domain, dp, se, ep, judul, tahun, is_tv):
+    """Satu episode: resolve → unduh → subtitle → upload → register → CC.
+    Return dict (jangan sys.exit — pemanggil mencatat hasil & lanjut)."""
+    pj = mb_play(domain, dp, se, ep)
+    data = pj.get("data") or {}
+    streams = [s for s in (data.get("streams") or []) if not s.get("vipLocked")]
+    if not data.get("hasResource") or not streams:
+        return {"ep": ep, "ok": False, "error": "tidak ada stream free"}
+    stream = _choose_stream(streams, QUALITY)
+    res = stream.get("resolutions")
+    target_size = int(stream.get("size") or 0)
+    if is_tv:
+        FILE = f"{judul} S{se:02d}E{ep:02d} [{res}p].mp4"
+    else:
+        FILE = f"{judul} ({tahun}) [{res}p].mp4"
+    FILE = re.sub(r'[<>:"/\\|?*]', "", FILE).strip()
+    say(f"  {FILE} — {target_size/1e6:.0f} MB, unduh…")
+
+    st_disk = shutil.disk_usage(".")
+    if target_size * 1.15 > st_disk.free:
+        return {"ep": ep, "ok": False,
+                "error": f"disk kurang (butuh {target_size*1.15/1e9:.1f} GB, "
+                         f"sisa {st_disk.free/1e9:.1f} GB)"}
+
+    if not mb_smart_download(domain, dp, se, ep, res, FILE):
+        try:
+            os.remove(FILE)
+        except OSError:
+            pass
+        return {"ep": ep, "ok": False, "error": "unduh gagal semua strategi"}
+    size = os.path.getsize(FILE)
+    say(f"  unduh OK ({size/1e6:.0f} MB) — subtitle…")
+
+    # subtitle resmi MovieBox (best-effort, per episode)
+    sub_text, sub_lan = None, None
+    if SUB_LANG:
+        try:
+            caps = ((mb_caption(domain, dp, stream).get("data") or {})
+                    .get("captions") or [])
+            cap = mb_pick_caption(caps, prefer=[SUB_LANG])
+            if cap and cap.get("url"):
+                raw = mb_http(cap["url"], timeout=90).read()
+                sub_text = raw.decode("utf-8-sig", "replace")
+                sub_lan = cap.get("lanName") or cap.get("lan")
+                if "-->" not in sub_text:
+                    sub_text = None
+        except Exception as e:
+            say("  subtitle dilewati:", repr(e)[:90])
+
+    # upload ke Abyss (3x percobaan)
+    say(f"  upload ke Abyss…")
+    up = None
+    for attempt in range(3):
+        cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
+               "2048", "--speed-time", "120",
+               "-F", f"file=@{FILE};type=video/mp4",
+               f"https://up.abyss.to/{ABYSS_KEY}"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=7300)
+        except subprocess.TimeoutExpired:
+            p = None
+        if p is not None:
+            try:
+                up = json.loads(p.stdout or b"{}")
+            except Exception:
+                up = None
+        if isinstance(up, dict) and up.get("status"):
+            break
+        up = None
+        time.sleep(10)
+    if not (isinstance(up, dict) and up.get("status")):
+        try:
+            os.remove(FILE)
+        except OSError:
+            pass
+        return {"ep": ep, "ok": False,
+                "error": f"upload Abyss ditolak ({up or 'tanpa jawaban'})"}
+    slug = up["slug"]
+    # bebaskan disk SEGERA (file aman di Abyss — pola v1.2.1)
+    try:
+        os.remove(FILE)
+    except OSError:
+        pass
+    say(f"  upload OK: slug {slug} — file lokal dihapus")
+
+    # register ke katalog situs
+    reg = register_one(slug, ep, res, size, sub_text, sub_lan, is_tv)
+    r = {"ep": ep, "ok": True, "slug": slug, "res": res, "size": size,
+         "sub_lan": sub_lan,
+         "reg_ok": bool(reg.get("ok")) and not reg.get("skip"),
+         "reg_skip": reg.get("skip"),
+         "reg_error": None if reg.get("ok") else str(reg.get("error"))[:160]}
+    if reg.get("retry"):
+        r["reg_pending"] = True
+        r["sub_text"] = sub_text  # utk ronde retry di akhir batch
+    else:
+        say("  register:", "OK" if reg.get("ok")
+            else f"GAGAL — {str(reg.get('error'))[:120]}")
+
+    # CC native Abyss (best-effort; login sekali per batch)
+    global ABYSS_JWT
+    if sub_text and ABYSS_EMAIL and ABYSS_PASSWORD:
+        try:
+            if ABYSS_JWT is None:
+                ABYSS_JWT = abyss_login(ABYSS_EMAIL, ABYSS_PASSWORD)
+            if ABYSS_JWT:
+                lang = (sub_lan or "Indonesia").strip()
+                code = abyss_put_subtitle(
+                    ABYSS_JWT, slug, lang, f"{lang_slug(lang)}.vtt",
+                    srt_to_vtt(sub_text))
+                r["sub_player_ok"] = code == 200
+        except Exception as e:
+            say("  CC player Abyss dilewati:", repr(e)[:90])
+    return r
+
+
+def run_bulk(domain, dp, sel, is_tv, eps):
+    """Loop utama mode bulk: satu episode per iterasi dengan budget chunk.
+    Marker ZS_BULK_REMAIN:<spec> dibaca runner utk antre chunk lanjutan."""
+    judul = sel.get("title") or "series"
+    tahun = (sel.get("releaseDate") or "")[:4]
+    se = SEASON
+    say(f"\nMODE BULK: {len(eps)} episode (S{se}, judul '{judul}') — "
+        f"budget chunk {BUDGET_MIN} menit")
+    summary_line(f"- Mode: **BULK** — {len(eps)} episode S{se} "
+                 f"(chunk ±{BUDGET_MIN} menit)")
+
+    results, remaining, t0 = [], [], time.time()
+    for i, ep in enumerate(eps):
+        if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
+            remaining = eps[i:]
+            say(f"\n⏸ Budget chunk tercapai ({BUDGET_MIN} mnt) — "
+                f"{len(remaining)} episode ditunda ke chunk berikutnya.")
+            break
+        say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
+        try:
+            r = process_episode(domain, dp, se, ep, judul, tahun, is_tv)
+        except urllib.error.HTTPError as e:
+            try:
+                domain = mb_domain()
+            except Exception:
+                pass
+            r = {"ep": ep, "ok": False, "error": f"play API HTTP {e.code}"}
+        except Exception as e:
+            r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
+        results.append(r)
+        if r.get("ok"):
+            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}")
+        else:
+            say(f"  ✘ E{ep} GAGAL: {r.get('error')}")
+
+    # ronde retry register yang masih "diproses Abyss" (max 3x60 dtk)
+    pend = [r for r in results if r.get("reg_pending")]
+    for r in pend:
+        reg = register_one(r["slug"], r["ep"], r["res"], r["size"],
+                           r.get("sub_text"), r.get("sub_lan"), is_tv,
+                           retries=3)
+        r["reg_ok"] = bool(reg.get("ok"))
+        r.pop("reg_pending", None)
+        r.pop("sub_text", None)
+        r["reg_error"] = None if reg.get("ok") else str(reg.get("error"))[:160]
+        say(f"  register ulang E{r['ep']}: "
+            + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+
+    ok_n = sum(1 for r in results if r.get("ok"))
+    reg_n = sum(1 for r in results if r.get("reg_ok"))
+    fail_n = len(results) - ok_n
+
+    say("\n" + "=" * 58)
+    say(f"BULK: {ok_n} episode terupload OK, {reg_n} terdaftar di situs, "
+        f"{fail_n} gagal" + (f", {len(remaining)} ditunda" if remaining else ""))
+    for r in results:
+        if r.get("ok"):
+            say(f"  E{r['ep']}: OK slug={r.get('slug')} {r.get('res')}p"
+                + ("  [register tertunda — ulang via slug_lama]"
+                   if r.get("reg_error") and not r.get("reg_ok") else ""))
+        else:
+            say(f"  E{r['ep']}: GAGAL — {r.get('error')}")
+    summary_line(f"- Hasil chunk: {ok_n} upload OK, {reg_n} register OK, "
+                 f"{fail_n} gagal")
+    if fail_n:
+        gagal = build_episode_spec([r["ep"] for r in results if not r.get("ok")])
+        summary_line(f"- Gagal (jalankan ulang dengan episodes `{gagal}`): "
+                     f"`{gagal}`")
+
+    if remaining:
+        spec = build_episode_spec(remaining)
+        say(f"\nSISA {len(remaining)} episode → chunk berikutnya otomatis.")
+        say(f"ZS_BULK_REMAIN:{spec}")
+        summary_line(f"- Chunk berikutnya (otomatis): episodes `{spec}`")
+    say("=" * 58)
+
+    if results and ok_n == 0 and not remaining:
+        sys.exit(1)
+
+
 def main():
     if not TITLE:
         fail("Input 'judul' kosong — isi kata kunci pencarian.")
     if not ABYSS_KEY:
         fail("Secret ABYSS_KEY belum diset di repo.")
+    if EPISODES_SPEC and REUSE_SLUG:
+        fail("Input 'episodes' (bulk) tidak bisa dipakai bersama 'slug_lama' ")
 
     egress = mb_ip()
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")
@@ -553,6 +845,20 @@ def main():
     # 2. resolve stream
     DOMAIN = mb_domain()
     say("Domain video:", DOMAIN)
+
+    # Task 92 — MODE BULK: banyak episode dalam satu dispatch (TV saja).
+    # Sisa episode di luar budget chunk di-antrekan otomatis oleh runner.
+    if EPISODES_SPEC:
+        if not is_tv:
+            fail("Input 'episodes' (bulk) hanya untuk SERIAL — pilih hasil "
+                 "pencarian bertipe SERIAL dengan indeks 'pilihan' yang benar.")
+        try:
+            eps = parse_episode_spec(EPISODES_SPEC)
+        except ValueError as e:
+            fail(f"Input 'episodes' tidak valid: {e}")
+        run_bulk(DOMAIN, DP, sel, True, eps)
+        return
+
     se = SEASON if is_tv else 0
     ep = EPISODE if is_tv else 0
     try:
