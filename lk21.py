@@ -1,43 +1,62 @@
 #!/usr/bin/env python3
 # =====================================================================
 #  lk21.py — Sumber LK21 (LayarKaca21) untuk pipeline ZeeStream
-# =====================================================================
-#  Rekon live 29 Okt 2026 (tv.nontonfilm.red — penerima alias lk21.fyi):
+#  ======================= V2 (Task 96b, 29 Okt 2026) ==================
 #
-#  STRUKTUR SITUS
-#    - WordPress tema LK21 (gmr). Pencarian: GET /?s=<kata-kunci>
-#    - Detail: https://tv.nontonfilm.red/<judul-tahun>/
-#    - Blok unduh: <div id="download"> → <a> per host/kualitas, SEMUA
-#      dibungkus shortlink monetisasi ouo.io
-#    - Player utama: iframe embed (kadang drive.google.com/file/d/<id>)
+#  REVOLUSI RESOLVER — MASALAH ouo & JALUR KELUAR:
+#    Blok unduh LK21 (Mixdrop/StreamTape/dll) SELALU dibalut shortlink
+#    ouo.io yang dilindungi Cloudflare Turnstile → MUSTAHIL dilewati
+#    dari server. (Itulah penyebab run pertama gagal exit 1.)
+#    TAPI player LK21 berupa iframe host BYSE (justplay.cam/e/<code>)
+#    yang TIDAK dibalut ouo — dan platform Byse bisa di-resolve 100%
+#    server-side:
 #
-#  POLA SHORTLINK ouo.io (kunci):
-#    (a) ouo.io/qs/<hash>?s=<URL-ASLI>   ← URL ASLI BOCOR di parameter s
-#        → cukup di-extract TANPA menyentuh ouo sama sekali.
-#    (b) ouo.io/<kode> (pola murni)      ← kini di-balut Cloudflare
-#        challenge ("Just a moment") → TIDAK bisa dilewati dari server
-#        script → item seperti ini DILEWATI (dicatat di log).
+#      1. GET  /api/videos/<code>/embed/details   (header X-Embed-Origin
+#         = halaman LK21) → embed_frame_url (host player asli, prefix
+#         rotasi per-request, dipakai sebagai Referer).
+#      2. POST .../embed/captcha                  → tantangan PoW
+#         (nonce + difficulty 16 bit, hash custom keluarga blake).
+#      3. Solve PoW (pow-solve.js via node ATAU pow-solve.c via gcc —
+#         keduanya identik bit-per-bit, ~0.3-1.5 dtk).
+#      4. POST .../embed/captcha/verify           → token captcha.
+#      5. POST /api/videos/access/challenge       → nonce perangkat.
+#      6. ECDSA P-256 (kunci dibuat sendiri, sign nonce) →
+#         POST /api/videos/access/attest          → fingerprint viewer
+#         (viewer_id/device_id/token/confidence) — fingerprint browser
+#         DILOLOSKAN meski dibuat server (confidence 0.88).
+#      7. POST .../embed/playback {fingerprint:{token,viewer_id,
+#         device_id,confidence}} + X-Captcha-Token + header X-Embed
+#         (Origin/Referer = LK21, Parent = iframe) → payload
+#         terenkripsi.
+#      8. Dekripsi AES-256-GCM (kunci = key_parts[v-1]‖key_parts[31-v])
+#         → JSON {sources:[HLS], tracks}.
+#      9. master.m3u8 → varian tertinggi → segmen .ts (+ grup subtitle
+#         WebVTT "Bahasa Indonesia" di hampir semua judul) — semuanya
+#         URL bertanda tangan 3 jam, diunduh multi-thread, disatukan
+#         jadi satu file → upload Abyss (flow zs_dl.py lama).
 #
-#  HOST FILE yang muncul (bervariasi per judul):
-#    file.drakor.club  → mirror file (perlu Referer situs, kadang 503)
-#    dood family       → dood.so/d/... (redirect ds2play/dsvplay dst) —
-#                        ekstraksi pass_md5 klasik
-#    streamtape        → ekstraksi get_video (token dari robotlink)
-#    mixdrop           → MDCore.wurl (obfuscated eval, regex defensif)
-#    vid21 / one-lak   → gate JS → tak bisa server-side (dilewati)
-#    gdrive embed      → jalur uc?export=download + tarian confirm
+#  Jadi sumber LK21 TETAP ADA di workflow (pilihan sumber: moviebox |
+#  lk21) — hanya mekanisme resolusinya yang pindah jalur embed.
 #
-#  SUBTITLE: item "Sub Indo" sering .srt LANGSUNG (lewat pola (a)) —
-#  diambil bila ter-ekstrak. Banyak file LK21 juga hardsub.
+#  Fallback lawas tetap dipertahankan bila halaman LK21 menyediakan
+#  host file tanpa ouo (langka) atau embed GDrive.
 # =====================================================================
 import base64
 import http.cookiejar
 import json
+import os
 import re
+import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import cryptography.hazmat.primitives.hashes as _hashes
+import cryptography.hazmat.primitives.asymmetric.ec as _ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -49,11 +68,15 @@ LK_DOMAINS = [
 ]
 _domain_cache = (None, 0.0)
 
-# cookie jar global (dood/streamtape kadang minta cookie dari halaman
-# embed sebelum pass_md5; gdrive butuh jar utk confirm)
 JAR = http.cookiejar.CookieJar()
 OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(JAR))
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+# ---------------------------------------------------------------------
+#  HTTP dasar
+# ---------------------------------------------------------------------
 
 def lk_http(url, referer=None, hdrs=None, timeout=40, retry=3):
     """GET dgn cookie jar + retry 502/503/504/429 (sama seperti mb_http)."""
@@ -80,6 +103,14 @@ def lk_http(url, referer=None, hdrs=None, timeout=40, retry=3):
     raise last
 
 
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _b64u_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
 def lk_domain():
     """Domain LK21 aktif — coba satu per satu, cache 30 menit."""
     global _domain_cache
@@ -91,7 +122,7 @@ def lk_domain():
             r = lk_http(d + "/?s=test", timeout=15, retry=1)
             body = r.read(60000).decode("utf-8", "replace")
             r.close()
-            if "gmr-" in body or "id=\"download\"" in body or \
+            if "gmr-" in body or 'id="download"' in body or \
                     "nontonfilm" in body.lower():
                 _domain_cache = (d.rstrip("/"), time.time())
                 return _domain_cache[0]
@@ -106,8 +137,7 @@ def lk_domain():
 # ---------------------------------------------------------------------
 
 def lk_search(kw, domain=None):
-    """Cari judul → daftar {title, year, slug}. Hasil = posting film/serial
-    saja (slug dengan tanda hubung, dibersihkan dari halaman statis)."""
+    """Cari judul → daftar {title, year, slug} (posting film/serial)."""
     domain = domain or lk_domain()
     r = lk_http(f"{domain}/?s={urllib.parse.quote(kw)}")
     html = r.read().decode("utf-8", "replace")
@@ -125,7 +155,6 @@ def lk_search(kw, domain=None):
                 "tag/", "season/")):
             continue
         seen.add(slug)
-        # judul dari slug: "cosmic-sin-2021" → "Cosmic Sin" (2021)
         parts = slug.rstrip("/").split("-")
         year = parts[-1] if parts and parts[-1].isdigit() and \
             len(parts[-1]) == 4 else ""
@@ -135,8 +164,8 @@ def lk_search(kw, domain=None):
 
 
 def lk_detail(slug, domain=None):
-    """Bedah halaman detail → blok unduh + embed gdrive + subtitle +
-    link episode (utk series)."""
+    """Bedah halaman detail → blok unduh + iframe player (Byse) + embed
+    gdrive + subtitle + link episode (utk series)."""
     domain = domain or lk_domain()
     if not slug.startswith("http"):
         url = f"{domain}/{slug.strip('/')}/"
@@ -146,7 +175,7 @@ def lk_detail(slug, domain=None):
     html = r.read().decode("utf-8", "replace")
     r.close()
 
-    # --- link episode utk SERIES: <judul>-episode-<N>/ ---
+    # --- link episode utk SERIES ---
     episode_links = []
     for m in re.finditer(
             rf'href="https?://[^"]*?/([a-z0-9-]+-episode-\d+)/?"', html):
@@ -154,10 +183,15 @@ def lk_detail(slug, domain=None):
         if ep_slug not in episode_links:
             episode_links.append(ep_slug)
 
-    # --- blok unduh ---
-    # Link unduhan SELALU eksternal (file hosts / shortlink), sedangkan
-    # tag a internal (genre/cast/related) memakai domain situs → filter
-    # host eksternal memangkas derau dgn akurat.
+    # --- iframe player (Byse & keluarga /e/<code>) — JALUR UTAMA V2 ---
+    byse = []
+    for m in re.finditer(
+            r'<iframe[^>]+src="(https?://([^/]+)/e/([a-zA-Z0-9_-]{4,}))"',
+            html):
+        if m.group(1) not in byse:
+            byse.append(m.group(1))
+
+    # --- blok unduh (fallback; mayoritas ouo → dilewati) ---
     root_host = urllib.parse.urlsplit(domain).netloc
     items, subs = [], []
     i = html.find('id="download"')
@@ -167,52 +201,44 @@ def lk_detail(slug, domain=None):
         href, label = m.group(1), re.sub(r"<[^>]+>|\s+", " ",
                                          m.group(2)).strip()
         real = ouo_unwrap(href)
-        gate = "" if real else "ouo-challenge"
         low = (real or href).lower()
-        # subtitle boleh dari domain mana pun (biasanya situs saudara)
         is_sub = low.endswith(".srt") or low.endswith(".vtt") or \
             "/subtitle" in label.lower() or "sub indo" in label.lower()
-        host = urllib.parse.urlsplit(real or href).hostname or ""
-        if real is None and is_sub:
-            subs.append("")  # sub dibalut ouo murni — tandai hadir
-            continue
         if real is None:
-            # ouo murni (CF-gated) → tandai & lewati, tapi log
-            items.append({"label": label, "quality": "",
-                          "url": None, "gate": gate})
+            if is_sub:
+                subs.append("")
+            else:
+                items.append({"label": label, "quality": "", "url": None,
+                              "gate": "ouo-challenge"})
             continue
         if is_sub:
             subs.append(real)
             continue
-        if host.endswith(root_host) or not host:
-            continue  # link internal situs — bukan item unduhan
-        if not label:
+        host = urllib.parse.urlsplit(real).hostname or ""
+        if host.endswith(root_host) or not host or not label:
             continue
         q = re.search(r"(\d{3,4})\s*p", label.lower())
         items.append({"label": label, "quality": q.group(1) if q else "",
-                      "url": real, "gate": gate})
+                      "url": real, "gate": ""})
 
-    # --- embed gdrive di area player ---
+    # --- embed gdrive di area player (fallback lawas) ---
     gdrive = []
     for m in re.finditer(r'drive\.google\.com/file/d/([a-zA-Z0-9_-]{10,})',
                          html):
         if m.group(1) not in gdrive:
             gdrive.append(m.group(1))
 
-    # --- judul & tahun dari halaman ---
     t = re.search(r"<h1[^>]*>([^<]{2,150})</h1>", html)
     title = t.group(1).strip() if t else slug
     return {"url": url, "title": title, "items": items, "subs": subs,
-            "gdrive": gdrive, "episode_links": episode_links}
+            "gdrive": gdrive, "episode_links": episode_links, "byse": byse}
 
 
 # ---------------------------------------------------------------------
-#  shortlink & extractor per-host
+#  shortlink ouo (hanya pola bocor ?s=; sisanya memang tak mungkin)
 # ---------------------------------------------------------------------
 
 def ouo_unwrap(url):
-    """Bocorkan URL asli dari ouo.io/qs/<h>?s=<ASLI>. Return None bila
-    pola murni (CF-challenge) — TIDAK dicoba dibypass."""
     if not url:
         return None
     m = re.search(r"[?&]s=(https?://.+)$", url)
@@ -223,17 +249,530 @@ def ouo_unwrap(url):
     return url.strip()
 
 
-def extract_dood(url, referer=None):
-    """Doodstream family (dood.so/wf/to → ds2play/dsvplay/d000d dst):
-    halaman /e/<id> → JS memanggil /pass_md5/<tok>/<code> → URL mp4 +
-    10 char acak. Return (url_langsung, referer_untuk_download) atau None."""
+# ---------------------------------------------------------------------
+#  PoW Byse — solver multi-backend (node → gcc → python), paritas sama
+# ---------------------------------------------------------------------
+
+def _pow_node(nonce, difficulty, log):
+    js = os.path.join(_HERE, "pow-solve.js")
+    r = subprocess.run(["node", js, nonce, str(difficulty), "30000"],
+                       capture_output=True, text=True, timeout=60)
+    out = r.stdout.strip()
+    return out if out and out not in ("TIMEOUT",) and not \
+        out.startswith("ERROR") else None
+
+
+def _pow_c(nonce, difficulty, log):
+    exe = "/tmp/zs-pow-solve"
+    if not os.path.exists(exe):
+        src = os.path.join(_HERE, "pow-solve.c")
+        r = subprocess.run(["gcc", "-O2", "-o", exe, src],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return None
+    r = subprocess.run([exe, nonce, str(difficulty), "30000"],
+                       capture_output=True, text=True, timeout=60)
+    out = r.stdout.strip()
+    return out if out and out != "TIMEOUT" else None
+
+
+def _pow_python(nonce, difficulty, log):
+    """Fallback murni Python (LAMBAT ±2-4 mnt utk difficulty 16) —
+    dipakai hanya bila node & gcc sama-sama absen. Urutan counter identik
+    dengan versi JS/C sehingga solusi sama persis."""
+    def rotl(t, e):
+        e &= 31
+        return t if e == 0 else ((t << e) | (t >> (32 - e))) & 0xFFFFFFFF
+
+    def ye(t):
+        t[0] = (t[0] + t[1]) & 0xFFFFFFFF
+        t[3] = rotl(t[3] ^ t[0], 16)
+        t[2] = (t[2] + t[3]) & 0xFFFFFFFF
+        t[1] = rotl(t[1] ^ t[2], 12)
+        t[0] = (t[0] + t[1]) & 0xFFFFFFFF
+        t[3] = rotl(t[3] ^ t[0], 8)
+        t[2] = (t[2] + t[3]) & 0xFFFFFFFF
+        t[1] = rotl(t[1] ^ t[2], 7)
+
+    def gr(data):
+        e = [1779033703, 3144134277, 1013904242, 2773480762]
+        for b in data:
+            e[0] = (e[0] + b) & 0xFFFFFFFF
+            e[0] = rotl(e[0], 7)
+            ye(e)
+        for _ in range(8):
+            ye(e)
+        r = [0] * 512
+        for i in range(512):
+            ye(e)
+            r[i] = (e[0] ^ e[2]) & 0xFFFFFFFF
+        for _ in range(2):
+            for s in range(512):
+                a = r[s] & 511
+                c = (r[s] + r[a]) & 0xFFFFFFFF
+                c = rotl(c, 13)
+                c ^= (r[(s + 1) & 511] * 2654435761) & 0xFFFFFFFF
+                r[s] = c
+                e[0] = (e[0] ^ c) & 0xFFFFFFFF
+                ye(e)
+        out = [0] * 8
+        for i in range(8):
+            ye(e)
+            s = e[0]
+            for c in range(64):
+                d = r[i * 64 + c]
+                s = (s + d) & 0xFFFFFFFF
+                s = rotl(s, 5)
+                s = s ^ ((d * 2246822519) & 0xFFFFFFFF)
+            out[i] = (s ^ e[2]) & 0xFFFFFFFF
+        return out
+
+    def zbits(words):
+        n = 0
+        for w in words:
+            if w == 0:
+                n += 32
+                continue
+            return n + (32 - w.bit_length())
+        return n
+
+    if difficulty <= 0:
+        return "0"
+    t0 = time.time()
+    prefix = nonce + ":"
+    s = 0
+    while True:
+        h = gr(bytearray([c & 255 for c in (prefix + str(s)).encode()]))
+        if zbits(h) >= difficulty:
+            return str(s)
+        s += 1
+        if s % 4096 == 0 and time.time() - t0 > 120:
+            if log:
+                log("   ⚠ PoW python lambat (bila sering: pasang node/gcc)")
+            return None
+
+
+def solve_pow(nonce, difficulty, log=None):
+    """Selesaikan tantangan PoW Byse → string angka, atau None."""
+    for fn, label in ((_pow_node, "node"), (_pow_c, "gcc"),
+                      (_pow_python, "python")):
+        try:
+            sol = fn(nonce, difficulty, log)
+        except Exception as e:
+            if log:
+                log(f"   ⚠ PoW [{label}]: {repr(e)[:70]}")
+            sol = None
+        if sol:
+            if log:
+                log(f"   PoW via [{label}]: {sol}")
+            return sol
+    return None
+
+
+# ---------------------------------------------------------------------
+#  RESOLVER BYSE — inti V2
+# ---------------------------------------------------------------------
+
+# fingerprint viewer di-cache modul — attest sekali, dipakai ulang
+# sampai expires_at (bulk 100 episode tidak 100x attestation)
+_FP_CACHE = {"fp": None, "exp": 0.0}
+
+
+def _byse_api(base, path, method="GET", body=None, extra=None, referer=None):
+    h = {"User-Agent": UA,
+         "Accept": "application/json, text/plain, */*", "Origin": base}
+    if referer:
+        h["Referer"] = referer
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    if extra:
+        h.update(extra)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                headers=h)
     try:
-        # normalisasi /d/<id> → /e/<id>
+        with OPENER.open(req, timeout=40) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"{}")
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        return None, {"err": repr(e)[:120]}
+
+
+def _fake_client():
+    """Atribut 'perangkat' yang diterima server attestation (confidence
+    0.88 — teruji). Tidak ada pemeriksaan hash nyata di sisi server."""
+    return {"user_agent": UA,
+            "brand_full_versions": [
+                {"brand": "Chromium", "version": "131.0.0.0"},
+                {"brand": "Not_A Brand", "version": "24.0.0.0"},
+                {"brand": "Google Chrome", "version": "131.0.0.0"}],
+            "platform": "Windows", "architecture": "x86", "bitness": "64",
+            "platform_version": "15.0.0", "model": "",
+            "ua_full_version": "131.0.0.0", "pixel_ratio": 1,
+            "screen_width": 1920, "screen_height": 1080, "color_depth": 24,
+            "languages": ["id-ID", "id", "en-US", "en"],
+            "timezone": "Asia/Jakarta", "hardware_concurrency": 8,
+            "device_memory": 8, "touch_points": 0,
+            "webgl_vendor": "Google Inc. (NVIDIA)",
+            "webgl_renderer": ("ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 "
+                               "Direct3D11 vs_5_0 ps_5_0)"),
+            "canvas_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+            "audio_hash": "9f8e7d6c5b4a392817f6e5d4c3b2a190",
+            "webgl_params_hash": "55667788990011223344556677889900",
+            "fonts_hash": "00112233445566778899aabbccddeeff",
+            "codecs_hash": "deadbeefcafebabe0123456789abcdef",
+            "media_devices": "ai1ao1vi2", "pointer_type": "mouse",
+            "extra": {"vendor": "Google Inc.",
+                      "appVersion": "5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/131.0.0.0 Safari/537.36"}}
+
+
+def _byse_attest(base, watch_url, log=None):
+    """Challenge + ECDSA sign + attest → fingerprint (di-cache modul)."""
+    if _FP_CACHE["fp"] and time.time() < _FP_CACHE["exp"] - 30:
+        return _FP_CACHE["fp"]
+    st, ch = _byse_api(base, "/api/videos/access/challenge", method="POST",
+                       body={}, referer=watch_url)
+    if st != 200 or not ch.get("nonce"):
+        raise RuntimeError(f"access/challenge gagal ({st})")
+    priv = _ec.generate_private_key(_ec.SECP256R1())
+    nums = priv.public_key().public_numbers()
+    public_jwk = {"kty": "EC", "crv": "P-256",
+                  "x": _b64url(nums.x.to_bytes(32, "big")),
+                  "y": _b64url(nums.y.to_bytes(32, "big")),
+                  "ext": True, "key_ops": ["verify"]}
+    sig = priv.sign(ch["nonce"].encode(), _ec.ECDSA(_hashes.SHA256()))
+    ri, si = decode_dss_signature(sig)
+    payload = {"viewer_id": "", "device_id": "",
+               "challenge_id": ch.get("challenge_id", ""),
+               "nonce": ch["nonce"],
+               "signature": _b64url(ri.to_bytes(32, "big") +
+                                    si.to_bytes(32, "big")),
+               "public_key": public_jwk, "client": _fake_client(),
+               "storage": {}, "attributes": {"entropy": "high"}}
+    st, att = _byse_api(base, "/api/videos/access/attest", method="POST",
+                        body=payload, referer=watch_url)
+    if st != 200 or not att.get("token"):
+        raise RuntimeError(f"access/attest gagal ({st})")
+    fp = {"token": att["token"], "viewer_id": att.get("viewer_id", ""),
+          "device_id": att.get("device_id", ""),
+          "confidence": att.get("confidence", 0)}
+    try:
+        import datetime
+        dt = datetime.datetime.fromisoformat(
+            att.get("expires_at", "").replace("Z", "+00:00"))
+        _FP_CACHE["exp"] = dt.timestamp()
+    except Exception:
+        _FP_CACHE["exp"] = time.time() + 480
+    _FP_CACHE["fp"] = fp
+    if log:
+        log(f"   attest OK (confidence {fp['confidence']})")
+    return fp
+
+
+def byse_resolve(embed_url, emb_page, log=None):
+    """Resolve iframe Byse (…/e/<code>) → {hls, sub_vtt, quality, size,
+    watch_url}. Semua langkah server-side; PoW via node/gcc/python.
+    emb_page = URL halaman LK21 (utk header X-Embed)."""
+    m = re.match(r"(https?://[^/]+)/e/([a-zA-Z0-9_-]{4,})", embed_url)
+    if not m:
+        return None
+    front, code = m.group(1), m.group(2)
+    emb_origin = urllib.parse.urlsplit(emb_page).scheme + "://" + \
+        urllib.parse.urlsplit(emb_page).netloc
+
+    # 1. details di FRONT (justplay) — dapat host player asli
+    st, det = _byse_api(front, f"/api/videos/{code}/embed/details",
+                        referer=f"{front}/e/{code}",
+                        extra={"X-Embed-Origin": emb_origin})
+    if st != 200 or not det.get("embed_frame_url"):
+        if log:
+            log(f"   ✘ byse details di front ({st}) — coba front sbg player")
+        frame_url = f"{front}/d/{code}"
+    else:
+        frame_url = det["embed_frame_url"]
+    base = "https://" + urllib.parse.urlsplit(frame_url).netloc
+
+    # 2. PoW + verify
+    st, cap = _byse_api(base, f"/api/videos/{code}/embed/captcha",
+                       method="POST", body={}, referer=frame_url)
+    if st != 200 or not cap.get("pow_nonce"):
+        raise RuntimeError(f"embed/captcha gagal ({st})")
+    sol = solve_pow(cap["pow_nonce"], cap.get("pow_difficulty", 16), log)
+    if sol is None:
+        raise RuntimeError("PoW tidak terpecahkan (node/gcc/python semua "
+                           "gagal/timeout)")
+    st, ver = _byse_api(base, f"/api/videos/{code}/embed/captcha/verify",
+                        method="POST",
+                        body={"pow_token": cap["pow_token"], "solution": sol},
+                        referer=frame_url)
+    if ver.get("status") != "ok":
+        raise RuntimeError(f"PoW verify gagal ({st})")
+
+    # 3. fingerprint attest (di-cache modul utk bulk)
+    fp = _byse_attest(base, frame_url, log)
+
+    # 4. playback
+    st, play = _byse_api(base, f"/api/videos/{code}/embed/playback",
+                         method="POST", body={"fingerprint": fp},
+                         extra={"X-Captcha-Token": ver["token"],
+                                "X-Embed-Origin": emb_origin,
+                                "X-Embed-Referer": emb_page,
+                                "X-Embed-Parent": f"{front}/e/{code}"},
+                         referer=frame_url)
+    if st != 200:
+        raise RuntimeError(f"embed/playback gagal ({st}): "
+                           f"{json.dumps(play)[:120]}")
+    pb = play.get("playback") or {}
+    if not pb.get("key_parts"):
+        raise RuntimeError("payload playback tanpa key_parts")
+    versi = int(pb.get("version") or 0)
+    sel = [i for i in (versi, 31 - versi) if 1 <= i <= len(pb["key_parts"])]
+    key = b"".join(_b64u_dec(pb["key_parts"][i - 1]) for i in sel)
+    try:
+        pt = AESGCM(key).decrypt(_b64u_dec(pb["iv"]),
+                                 _b64u_dec(pb["payload"]), None)
+        data = json.loads(pt.decode())
+    except Exception as e:
+        raise RuntimeError(f"dekripsi AES gagal: {repr(e)[:100]}")
+
+    srcs = data.get("sources") or []
+    if not srcs:
+        raise RuntimeError("playback terdekripsi tanpa sources")
+    # ambil resolusi tertinggi (label "480p"/"720p"/…)
+    def hight(s):
+        try:
+            return int(s.get("height") or 0)
+        except (TypeError, ValueError):
+            return 0
+    best = sorted(srcs, key=hight)[-1]
+    res = {"hls": best.get("url"), "quality": best.get("label") or
+           f"{hight(best)}p",
+           "size": int(best.get("size_bytes") or 0),
+           "watch_url": frame_url, "host": base, "code": code,
+           "tracks": data.get("tracks") or []}
+    if log:
+        log(f"   byse OK: {res['quality']} "
+            f"({res['size']/1e6:.0f} MB) via {urllib.parse.urlsplit(frame_url).netloc}")
+    return res
+
+
+# ---------------------------------------------------------------------
+#  HLS: playlist → varian → segmen; unduh multi-thread; subtitle VTT
+# ---------------------------------------------------------------------
+
+def hls_map(master_url, referer=None):
+    """Master m3u8 → {variant_url, segments[], sub_uri, sub_segments[]}.
+    Varian = bandwidth tertinggi; sub = grup SUBTITLES berbahasa id."""
+    r = lk_http(master_url, referer=referer, hdrs={"Accept": "*/*"},
+                timeout=30)
+    master = r.read().decode("utf-8", "replace")
+    r.close()
+    variants, sub_uri = [], None
+    lines = master.splitlines()
+    for i, l in enumerate(lines):
+        if l.startswith("#EXT-X-STREAM-INF"):
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if nxt and not nxt.startswith("#"):
+                variants.append(nxt.strip())
+        if l.startswith("#EXT-X-MEDIA:TYPE=SUBTITLES"):
+            msub = re.search(r'LANGUAGE="([^"]*)"', l)
+            muri = re.search(r'URI="([^"]+)"', l)
+            if muri and (not sub_uri or
+                         (msub and msub.group(1) in ("id", "ind", "id-ID"))):
+                sub_uri = muri.group(1)
+    if not variants:
+        raise RuntimeError("master.m3u8 tanpa varian")
+    best_bw, variant_url = -1, variants[0]
+    for i, l in enumerate(lines):
+        if l.startswith("#EXT-X-STREAM-INF"):
+            mbw = re.search(r"BANDWIDTH=(\d+)", l)
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if mbw and nxt and not nxt.startswith("#") and \
+                    int(mbw.group(1)) > best_bw:
+                best_bw = int(mbw.group(1))
+                variant_url = nxt.strip()
+    r = lk_http(variant_url, referer=referer, hdrs={"Accept": "*/*"},
+                timeout=30)
+    var = r.read().decode("utf-8", "replace")
+    r.close()
+    segments = [l.strip() for l in var.splitlines()
+                if l.strip() and not l.startswith("#")]
+    sub_segments = []
+    if sub_uri:
+        try:
+            r = lk_http(sub_uri, referer=referer, hdrs={"Accept": "*/*"},
+                        timeout=30)
+            sv = r.read().decode("utf-8", "replace")
+            r.close()
+            sub_segments = [l.strip() for l in sv.splitlines()
+                            if l.strip() and not l.startswith("#")]
+        except Exception:
+            sub_segments = []
+    return {"variant_url": variant_url, "segments": segments,
+            "sub_uri": sub_uri, "sub_segments": sub_segments}
+
+
+def download_hls(segments, out_path, referer=None, workers=6,
+                 log=None, progress=None):
+    """Unduh segmen .ts multi-thread → satu file. Return (ok, pesan).
+    progress(done, total) dipanggil tiap segmen selesai."""
+    total = len(segments)
+    done = [0]
+    fails = []
+    lock = threading.Lock()
+
+    def pull(idx, url, tries=4):
+        for t in range(tries):
+            try:
+                r = lk_http(url, referer=referer, hdrs={"Accept": "*/*"},
+                            timeout=60, retry=1)
+                data = r.read()
+                r.close()
+                if len(data) < 188:
+                    raise ValueError("segmen kosong")
+                return idx, data
+            except Exception:
+                time.sleep(1 + t * 2)
+        return idx, None
+
+    # urutan hasil dgn slot per segmen supaya file tersusun benar
+    slots = {}
+    next_worker = [0]
+
+    import queue
+    q = queue.Queue()
+    for i, u in enumerate(segments):
+        q.put((i, u))
+
+    def worker():
+        while True:
+            try:
+                i, u = q.get_nowait()
+            except Exception:
+                return
+            idx, data = pull(i, u)
+            with lock:
+                if data is None:
+                    fails.append(i)
+                else:
+                    slots[idx] = data
+                done[0] += 1
+                if progress:
+                    try:
+                        progress(done[0], total)
+                    except Exception:
+                        pass
+                q.task_done()
+
+    ths = [threading.Thread(target=worker) for _ in range(max(1, workers))]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    if fails:
+        return False, f"{len(fails)} segmen gagal (mis. {fails[:5]})"
+    with open(out_path, "wb") as f:
+        for i in range(total):
+            f.write(slots.get(i, b""))
+    return True, "selesai"
+
+
+_PROMO_CUES = re.compile(
+    r"jual|order|shopee|tokopedia|wa\b|08[0-9]{8,}|subtitle by|kunjungi",
+    re.I)
+
+
+def fetch_sub_vtt(sub_segments, referer=None, log=None, workers=6):
+    """Unduh segmen .vtt (multi-thread) → satukan jadi teks VTT (filter
+    cue promosi yang umum di sub ripper). Return teks vtt ATAU None."""
+    if not sub_segments:
+        return None
+    import queue
+    q = queue.Queue()
+    for i, u in enumerate(sub_segments):
+        q.put((i, u))
+    slots, lock = [None] * len(sub_segments), threading.Lock()
+
+    def worker():
+        while True:
+            try:
+                i, u = q.get_nowait()
+            except Exception:
+                return
+            try:
+                r = lk_http(u, referer=referer, hdrs={"Accept": "*/*"},
+                            timeout=40, retry=2)
+                txt = r.read().decode("utf-8", "replace")
+                r.close()
+            except Exception:
+                continue
+            with lock:
+                slots[i] = txt
+
+    ths = [threading.Thread(target=worker) for _ in range(max(1, workers))]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+
+    cues = []
+    for txt in slots:
+        if not txt:
+            continue
+        txt = re.sub(r"^WEBVTT[^\n]*\n+", "", txt.strip())
+        blocks = [b for b in re.split(r"\n\s*\n", txt) if "-->" in b]
+        for b in blocks:
+            body = b.split("-->", 1)[1]
+            if _PROMO_CUES.search(body) and len(body.split()) < 25:
+                continue  # cue iklan ripper — buang
+            b = b.strip()
+            if cues and cues[-1] == b:
+                continue  # cue duplikat di batas segmen vtt
+            cues.append(b)
+    if not cues:
+        return None
+    return "\n\n".join(cues)
+
+
+def vtt_to_srt(text):
+    """WebVTT → SRT (dipakai register/cc Abyss di zs_dl.py)."""
+    if not text:
+        return None
+    t = re.sub(r"^WEBVTT[^\n]*\n+", "", text.strip())
+    blocks = [b for b in re.split(r"\n\s*\n", t) if "-->" in b]
+    out = []
+    for n, b in enumerate(blocks, 1):
+        lines = b.strip().splitlines()
+        # buang baris nomor cue lama, konversi titik → koma di timing
+        if len(lines) and re.fullmatch(r"\d+", lines[0].strip()):
+            lines = lines[1:]
+        for j, ln in enumerate(lines):
+            if "-->" in ln:
+                ln = ln.replace(".", ",")
+            lines[j] = ln
+        out.append(f"{n}\n" + "\n".join(lines).strip())
+    return "\n\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------
+#  extractor per-host lawas (fallback bila bukan Byse)
+# ---------------------------------------------------------------------
+
+def extract_dood(url, referer=None):
+    """Doodstream family — pass_md5 klasik."""
+    try:
         m = re.search(r"(https?://[^/]+)/[de]/([a-z0-9]+)", url)
         if not m:
             return None
         base, code = m.group(1), m.group(2)
-        r = lk_http(f"{base}/e/{code}", referer=referer or "https://tv.nontonfilm.red/", timeout=15, retry=1)
+        r = lk_http(f"{base}/e/{code}", referer=referer or
+                    "https://tv.nontonfilm.red/", timeout=15, retry=1)
         html = r.read().decode("utf-8", "replace")
         r.close()
         fm = re.search(r"/pass_md5/([a-f0-9]{16,})/" + re.escape(code), html)
@@ -242,37 +781,33 @@ def extract_dood(url, referer=None):
             return None
         pm = (host.group(1) if host else f"{base}/pass_md5") + \
             fm.group(0)[len("/pass_md5"):]
-        r2 = lk_http(pm, referer=f"{base}/e/{code}", timeout=15, retry=1, hdrs={
-            "Accept": "*/*"})
+        r2 = lk_http(pm, referer=f"{base}/e/{code}", timeout=15, retry=1,
+                     hdrs={"Accept": "*/*"})
         dest = r2.read(400).decode("utf-8", "replace").strip()
         r2.close()
         if not dest.startswith("http"):
             return None
-        final = dest + "".join(
-            __import__("random").choice("abcdefghijklmnopqrstuvwxyz0123456789")
-            for _ in range(10)) + ("?direct=1" if "?" not in dest else "")
+        import random
+        final = dest + "".join(random.choice(
+            "abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10)) + \
+            ("?direct=1" if "?" not in dest else "")
         return final, pm
     except Exception:
         return None
 
 
 def extract_streamtape(url, referer=None):
-    """Streamtape: halaman embed berisi robotlink: '…get_video?id=' + a
-    + '&expires=' + b + '&ip=' + c + '&token=' + d (4 bagian split)."""
+    """Streamtape — robotlink get_video (4 bagian)."""
     try:
-        r = lk_http(url.replace("/v/", "/e/"), referer=referer or "https://tv.nontonfilm.red/", timeout=15, retry=1)
+        r = lk_http(url.replace("/v/", "/e/"), referer=referer or
+                    "https://tv.nontonfilm.red/", timeout=15, retry=1)
         html = r.read().decode("utf-8", "replace")
         r.close()
-        # pola JS terobfuscate; tangkap semua token bagian per bagian
-        parts = re.findall(r"fetch\('|/get_video\?id=", html)
-        if not parts:
-            return None
         seg = re.search(r"/get_video\?id=(.*)", html)
         if not seg:
             return None
         tail = seg.group(1)[:600]
-        ids = re.findall(r"'([^']{3,64})'", tail) or \
-            re.findall(r'\+([^+]+?)\+', tail)
+        ids = re.findall(r"'([^']{3,64})'", tail)
         if len(ids) < 4:
             return None
         host_m = re.search(r"https?://([a-z0-9.-]+)/(?:v|e)/", url)
@@ -284,9 +819,10 @@ def extract_streamtape(url, referer=None):
 
 
 def extract_mixdrop(url, referer=None):
-    """Mixdrop: cari MDCore.wurl di dalam string eval (regex defensif)."""
+    """Mixdrop — MDCore.wurl."""
     try:
-        r = lk_http(url.replace("/f/", "/e/"), referer=referer or "https://tv.nontonfilm.red/", timeout=15, retry=1)
+        r = lk_http(url.replace("/f/", "/e/"), referer=referer or
+                    "https://tv.nontonfilm.red/", timeout=15, retry=1)
         html = r.read().decode("utf-8", "replace")
         r.close()
         m = re.search(r'wurl\s*[=:]\s*["\']([^"\']{10,160})["\']', html)
@@ -300,32 +836,11 @@ def extract_mixdrop(url, referer=None):
         return None
 
 
-def extract_clicknupload(url, referer=None):
-    """Clicknupload: halaman file punya form POST; versi ringan — bila ada
-    direct link (file/download) di HTML, pakai; selain itu None."""
-    try:
-        r = lk_http(url, referer=referer or "https://tv.nontonfilm.red/", timeout=15, retry=1)
-        html = r.read().decode("utf-8", "replace")
-        r.close()
-        m = re.search(r'href="(https?://[^"]*(?:files/|/d/)[^"]{8,200})"', html)
-        if m:
-            return m.group(1), None
-        return None
-    except Exception:
-        return None
-
-
 EXTRACTORS = {
     "dood": extract_dood,
     "streamtape": extract_streamtape,
     "mixdrop": extract_mixdrop,
-    "clickn": extract_clicknupload,
 }
-
-# host yang JELAS bukan file unduhan (iklan/trailer/sosial) — jangan diprobe
-SKIP_HOSTS = ("youtube.com", "youtu.be", "imdb.com", "facebook.com",
-              "t.me", "telegram", "twitter.com", "instagram.com",
-              "whatsapp", "ouo.io", "ouo.press", "shrinkme", "ouo")
 
 
 def host_of(url):
@@ -336,9 +851,7 @@ def host_of(url):
 
 
 def probe_video(url, referer=None, timeout=15):
-    """Range 0-1023 → (ok, code, ctype, size_total)."""
-    h = {"User-Agent": UA, "Range": "bytes=0-1023",
-         "Accept": "*/*"}
+    h = {"User-Agent": UA, "Range": "bytes=0-1023", "Accept": "*/*"}
     if referer:
         h["Referer"] = referer
     try:
@@ -371,8 +884,7 @@ def probe_video(url, referer=None, timeout=15):
 
 
 def resolve_direct(items, quality="auto", log=None):
-    """Kaskade item terurut → (url_langsung, referer, quality_label, size).
-    Urutkan: kualitas terpilih/ketinggian dulu; lewati gate ouo-challenge."""
+    """Kaskade item unduh lawas (host terekspos tanpa ouo — langka)."""
     def say(*a):
         if log:
             log(*a)
@@ -390,66 +902,39 @@ def resolve_direct(items, quality="auto", log=None):
             w = int(str(want).replace("p", ""))
         except ValueError:
             w = 0
-        exact = [it for it in items if qval(it) == w]
-        lower = sorted([it for it in items if 0 < qval(it) < w],
-                       key=qval, reverse=True)
-        higher = sorted([it for it in items if qval(it) > w > 0], key=qval)
-        other = [it for it in items if qval(it) == 0]
-        cand = exact + lower + higher + other
-
+        cand = [it for it in items if qval(it) == w] + \
+            sorted([it for it in items if 0 < qval(it) < w], key=qval,
+                   reverse=True)
     for it in cand:
         if not it.get("url"):
-            say(f"   ⏭ {it['label']}: dibalut shortlink Cloudflare "
-                "(ouo murni) — dilewati otomatis")
             continue
-        url, ref = it["url"], None
+        url = it["url"]
         host = host_of(url)
-        if any(s in host for s in SKIP_HOSTS):
-            continue  # bukan host file
         label = it["label"]
-        # host extractor
-        if any(host.endswith(s) for s in ("drakor.club",)):
-            ref = "https://tv.nontonfilm.red/"
-            ok, code, ctype, size = probe_video(url, ref)
-            if ok:
-                return {"url": url, "referer": ref,
-                        "quality": it.get("quality") or "", "size": size}
-            say(f"   ✘ {label}: HTTP {code} ({host}) — coba host lain")
-            continue
         for key, fn in EXTRACTORS.items():
             if key in host or (key == "dood" and
                                any(s in host for s in ("dood", "ds2", "dsv",
-                                                       "d000", "playmogo",
-                                                       "doo"))):
+                                                       "d000", "doo"))):
                 got = fn(url, referer="https://tv.nontonfilm.red/")
                 if not got:
-                    say(f"   ✘ {label}: ekstraksi {key} gagal")
                     break
                 durl, dref = got
                 ok, code, ctype, size = probe_video(durl, dref)
                 if ok:
                     return {"url": durl, "referer": dref,
-                            "quality": it.get("quality") or "",
-                            "size": size}
-                say(f"   ✘ {label}: {key} probe HTTP {code}")
+                            "quality": it.get("quality") or "", "size": size}
                 break
         else:
-            # host tak dikenal — coba langsung (bila langsung video)
-            ok, code, ctype, size = probe_video(url, ref)
+            ok, code, ctype, size = probe_video(url)
             if ok:
-                return {"url": url, "referer": ref,
+                return {"url": url, "referer": None,
                         "quality": it.get("quality") or "", "size": size}
-            say(f"   ✘ {label}: host {host or '?'} tidak terekspos "
-                f"langsung ({code})")
+        say(f"   ✘ {label}: {host or '?'} ({code})")
     return None
 
 
 def resolve_gdrive(file_id, quality="", log=None):
-    """Jalur gdrive: uc?export=download → bila HTML confirm (file besar),
-    ikuti form action+confirm+uuid. Return dict atau None."""
-    def say(*a):
-        if log:
-            log(*a)
+    """Jalur gdrive embed (fallback lawas)."""
     try:
         u = ("https://drive.google.com/uc?export=download&id="
              + urllib.parse.quote(file_id))
@@ -463,67 +948,77 @@ def resolve_gdrive(file_id, quality="", log=None):
             r.close()
             act = re.search(r'action="([^"]+)"', html)
             if not act:
-                say("   ✘ gdrive: file tidak dapat diakses "
-                    "(404/private/quota)")
                 return None
             params = dict(re.findall(
                 r'name="(\w+)" value="([^"]*)"', html))
             q = urllib.parse.urlencode(params)
             dest = act.group(1).replace("&amp;", "&")
-            if "?" not in dest:
-                dest += "?" + q
-            else:
-                dest += "&" + q
+            dest += ("&" if "?" in dest else "?") + q
             ok, code, ctype2, size = probe_video(dest)
             if ok:
-                return {"url": dest, "referer": None,
-                        "quality": quality, "size": size}
-            say(f"   ✘ gdrive: probe HTTP {code}")
+                return {"url": dest, "referer": None, "quality": quality,
+                        "size": size}
             return None
-        # bukan HTML → kemungkinan langsung file
         size = int(r.headers.get("Content-Length") or 0)
         r.close()
         return {"url": u, "referer": None, "quality": quality, "size": size}
-    except Exception as e:
-        if log:
-            log("   ✘ gdrive:", repr(e)[:90])
+    except Exception:
         return None
 
 
 # ---------------------------------------------------------------------
-#  resolver tingkat judul (dipakai zs_dl.py)
+#  resolver tingkat judul (dipakai zs_dl.py) — PRIORITY: Byse embed
 # ---------------------------------------------------------------------
 
-def resolve_from_detail(det, quality="auto", log=None):
-    """Resolve URL unduh dari HASIL lk_detail (tanpa pencarian ulang) —
-    dipakai mode bulk zs_dl agar 100 episode ≠ 100 pencarian."""
+def resolve_from_detail(det, quality="auto", log=None, season=1):
+    """Resolve dari HASIL lk_detail. Urutan V2:
+       (1) iframe Byse → HLS + subtitle Indonesia bawaan
+       (2) host terekspos tanpa ouo (langka)
+       (3) embed gdrive."""
+    def say(*a):
+        if log:
+            log(*a)
+
+    # ---- (1) BYSE — jalur utama ----
+    for embed_url in det.get("byse") or []:
+        say("  mencoba player Byse:", embed_url[:70])
+        try:
+            res = byse_resolve(embed_url, det["url"], log)
+        except Exception as e:
+            say(f"   ✘ byse: {repr(e)[:110]}")
+            continue
+        if res and res.get("hls"):
+            sub_srt = None
+            try:
+                peta = hls_map(res["hls"], referer=res["watch_url"])
+                res["sub_uri"] = peta.get("sub_uri")
+                res["n_segments"] = len(peta.get("segments") or [])
+                if peta.get("sub_segments"):
+                    say(f"   subtitle Indonesia bawaan: "
+                        f"{len(peta['sub_segments'])} segmen vtt")
+                    vtt = fetch_sub_vtt(peta["sub_segments"],
+                                        referer=res["watch_url"], log=log)
+                    sub_srt = vtt_to_srt(vtt)
+            except Exception as e:
+                say(f"   ⚠ peta HLS: {repr(e)[:90]}")
+            got = {"hls": res["hls"], "url": res["hls"],
+                   "referer": res["watch_url"],
+                   "quality": res.get("quality") or "",
+                   "size": res.get("size") or 0,
+                   "source_page": det["url"], "engine": "byse",
+                   "sub_srt": sub_srt}
+            return got
+
+    # ---- (2) host terekspos (lawas) ----
     got = resolve_direct(det["items"], quality, log)
     if got:
         got["sub_url"] = next((s for s in det["subs"] if s), None)
         got["source_page"] = det["url"]
         return got
-    for fid in det["gdrive"]:
-        if log:
-            log("  mencoba embed GDrive:", fid)
-        g = resolve_gdrive(fid, quality, log)
-        if g:
-            g["sub_url"] = next((s for s in det["subs"] if s), None)
-            g["source_page"] = det["url"]
-            return g
-    return None
 
-
-def resolve_from_detail(det, quality="auto", log=None):
-    """Resolve URL unduh dari HASIL lk_detail (tanpa pencarian ulang) —
-    dipakai mode bulk zs_dl agar 100 episode ≠ 100 pencarian."""
-    got = resolve_direct(det["items"], quality, log)
-    if got:
-        got["sub_url"] = next((s for s in det["subs"] if s), None)
-        got["source_page"] = det["url"]
-        return got
+    # ---- (3) gdrive embed (lawas) ----
     for fid in det["gdrive"]:
-        if log:
-            log("  mencoba embed GDrive:", fid)
+        say("  mencoba embed GDrive:", fid)
         g = resolve_gdrive(fid, quality, log)
         if g:
             g["sub_url"] = next((s for s in det["subs"] if s), None)
@@ -534,9 +1029,7 @@ def resolve_from_detail(det, quality="auto", log=None):
 
 def resolve_title(title, pick=0, quality="auto", season=1, episode=1,
                   log=None):
-    """Cari + pilih + resolve SATU target (film atau SxE series).
-    Return dict: {kind: 'movie'|'tv', title, year, url, referer, size,
-    quality, sub_url, source_page} — atau raise RuntimeError dgn pesan."""
+    """Cari + pilih + resolve SATU target (film atau SxE series)."""
     def say(*a):
         if log:
             log(*a)
@@ -554,9 +1047,7 @@ def resolve_title(title, pick=0, quality="auto", season=1, episode=1,
         say("  " + line)
         listing.append(f"- `{i}` **{it.get('title', '?')}** "
                        f"({it.get('year', '-')})")
-    # buat step summary bila jalan di Actions
     try:
-        import os
         s = os.environ.get("GITHUB_STEP_SUMMARY")
         if s:
             with open(s, "a", encoding="utf-8") as f:
@@ -571,12 +1062,12 @@ def resolve_title(title, pick=0, quality="auto", season=1, episode=1,
     det = lk_detail(sel["slug"], dom)
     is_tv = bool(det["episode_links"])
     say("Tipe:", "SERIES" if is_tv else "Film",
-        f"({len(det['episode_links'])} link episode)"
-        if is_tv else f"({len(det['items'])} item unduh)")
+        f"({len(det['episode_links'])} link episode)" if is_tv
+        else f"(player: {len(det['byse'])} byse, unduh: "
+             f"{len(det['items'])} item)")
 
     target_slug = sel["slug"]
     if is_tv:
-        # halaman episode: <slug-film>-episode-<N>
         eps = sorted(
             set(int(re.search(r"episode-(\d+)$", e).group(1))
                 for e in det["episode_links"]
@@ -594,6 +1085,6 @@ def resolve_title(title, pick=0, quality="auto", season=1, episode=1,
                     "title": det["title"], "year": sel["year"]})
         return got
     raise RuntimeError(
-        "Semua host unduh LK21 judul ini tidak terekspos server-side "
-        "(shortlink ouo murni / host JS-gated) — pakai sumber MovieBox "
-        "untuk judul ini, atau coba judul lain.")
+        "LK21: tidak ada jalur unduh yang terekspos server-side untuk "
+        "judul ini (player Byse absen/berubah, unduhan ouo, gdrive "
+        "kosong) — coba sumber MovieBox.")

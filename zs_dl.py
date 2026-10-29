@@ -851,6 +851,46 @@ def lk21_download(got, out_name):
     return False
 
 
+def lk21_hls_download(got, out_name):
+    """Task 96b — unduh HLS Byse (segmen .ts multi-thread → satu file).
+    Return True bila semua segmen lengkap."""
+    try:
+        peta = lk21.hls_map(got["hls"], referer=got.get("referer"))
+    except Exception as e:
+        say(f"   ✘ peta HLS gagal: {repr(e)[:110]}")
+        return False
+    segs = peta["segments"]
+    if not segs:
+        say("   ✘ playlist tanpa segmen")
+        return False
+    say(f"   {len(segs)} segmen HLS — unduh 6-thread…")
+    last = [-1]
+    t0 = time.time()
+
+    def prog(done, total):
+        pct = done * 100 // total
+        if pct != last[0] and (pct % 5 == 0 or done == total):
+            last[0] = pct
+            mb = os.path.getsize(out_name) / 1e6 if os.path.exists(out_name) else 0
+            el = time.time() - t0
+            say(f"      {pct:3d}% ({done}/{total} seg, {el:.0f}s)")
+
+    ok, msg = lk21.download_hls(segs, out_name + ".part",
+                                referer=got.get("referer"), workers=6,
+                                log=None, progress=prog)
+    if not ok:
+        say(f"   ✘ HLS: {msg}")
+        try:
+            os.remove(out_name + ".part")
+        except OSError:
+            pass
+        return False
+    os.replace(out_name + ".part", out_name)
+    say(f"   SELESAI [HLS]: {out_name} "
+        f"({os.path.getsize(out_name)/1e6:.0f} MB)")
+    return True
+
+
 def lk21_process_one(dom, sel, ep, is_tv):
     """LK21 satu target: resolve → unduh → sub SRT → upload → register.
     Return dict hasil (tidak sys.exit — pemanggil melanjutkan)."""
@@ -870,10 +910,11 @@ def lk21_process_one(dom, sel, ep, is_tv):
         return {"ep": ep, "ok": False,
                 "error": "tak ada host LK21 yang terekspos server-side "
                          "(ouo murni/JS-gated) — coba sumber MovieBox"}
+    is_byse = got.get("engine") == "byse"
     try:
-        res = int(str(got.get("quality") or "0").replace("p", "")) or 720
-    except ValueError:
-        res = 720
+        res = int(re.sub(r"[^0-9]", "", str(got.get("quality") or "")) or 480)
+    except Exception:
+        res = 480
     size_est = int(got.get("size") or 0)
     if is_tv:
         FILE = f"{judul} S{SEASON:02d}E{ep:02d} [{res}p].mp4"
@@ -881,15 +922,24 @@ def lk21_process_one(dom, sel, ep, is_tv):
         FILE = f"{judul} ({tahun}) [{res}p].mp4"
     FILE = re.sub(r'[<>:"/\\|?*]', "", FILE).strip()
     say(f"  {FILE} — dari {got['source_page'][:70]}")
-    say(f"   unduh {res}p " +
-        (f"≈{size_est/1e6:.0f} MB" if size_est else "(ukuran tak diketahui)")
-        + "…")
+    if is_byse:
+        say(f"   player Byse → HLS {got.get('quality')} " +
+            (f"≈{size_est/1e6:.0f} MB, " if size_est else "") +
+            f"{got.get('n_segments', '?')} segmen")
+    else:
+        say(f"   unduh {res}p " +
+            (f"≈{size_est/1e6:.0f} MB" if size_est else "(ukuran tak diketahui)")
+            + "…")
 
     if size_est * 1.15 > shutil.disk_usage(".").free:
         return {"ep": ep, "ok": False,
                 "error": f"disk kurang (butuh ≈{size_est*1.15/1e9:.1f} GB)"}
 
-    if not lk21_download(got, FILE):
+    if is_byse:
+        ok = lk21_hls_download(got, FILE)
+    else:
+        ok = lk21_download(got, FILE)
+    if not ok:
         try:
             os.remove(FILE)
         except OSError:
@@ -898,23 +948,30 @@ def lk21_process_one(dom, sel, ep, is_tv):
     size = os.path.getsize(FILE)
     say(f"  unduh OK ({size/1e6:.0f} MB) — subtitle…")
 
-    # subtitle SRT LK21 (bila link terbocor dari shortlink)
+    # subtitle — V2: SRT bawaan Byse (sub WebVTT Indonesia dari HLS)
+    # lebih dulu; baru SRT link situs (lawas)
     sub_text, sub_lan = None, None
-    sub_url = got.get("sub_url")
-    if sub_url and SUB_LANG:
-        try:
-            raw = lk21.lk_http(sub_url, timeout=60).read()
-            sub_text = raw.decode("utf-8-sig", "replace")
-            if "-->" not in sub_text:
-                sub_text = None
+    if SUB_LANG:
+        if got.get("sub_srt") and "-->" in got["sub_srt"]:
+            sub_text = got["sub_srt"]
+            sub_lan = "Indonesia"
+            say(f"  subtitle bawaan Byse: {len(sub_text)} karakter")
+        else:
+            sub_url = got.get("sub_url")
+            if sub_url:
+                try:
+                    raw = lk21.lk_http(sub_url, timeout=60).read()
+                    sub_text = raw.decode("utf-8-sig", "replace")
+                    if "-->" not in sub_text:
+                        sub_text = None
+                    else:
+                        sub_lan = "Indonesia"
+                        say(f"  subtitle LK21: {len(sub_text)} karakter")
+                except Exception as e:
+                    say("  subtitle LK21 dilewati:", repr(e)[:80])
             else:
-                sub_lan = "Indonesia"
-                say(f"  subtitle LK21: {len(sub_text)} karakter")
-        except Exception as e:
-            say("  subtitle LK21 dilewati:", repr(e)[:80])
-    elif SUB_LANG:
-        say("  subtitle SRT LK21 tidak terbuka (shortlink) — file LK21 "
-            "umumnya sudah hardsub Indonesia")
+                say("  tanpa subtitle terpisah — isi Byse umumnya punya "
+                    "track Indonesia di player")
 
     # upload ke Abyss (3x) — logika sama dgn jalur MovieBox
     say("  upload ke Abyss…")

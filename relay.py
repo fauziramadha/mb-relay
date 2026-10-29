@@ -28,8 +28,7 @@
 #    GET  /joblog?from=N       ekor log pekerjaan + status hidup/exit
 #
 #  HOST yang DIBOLEHKAN (whitelist — bukan open proxy):
-#    *.hakunaymatata.com  (bcdnxw = file video, cacdn = subtitle) [MovieBox]
-#    *.drakor.club        (mirror file LK21 — Task 96)
+#    *.hakunaymatata.com  (bcdnxw = file video, cacdn = subtitle)
 #  Referer otomatis diambil dari get-domain resmi (di-cache 10 menit)
 #  bila parameter ref tidak diberikan; host cacdn dikirim tanpa referer.
 #
@@ -58,8 +57,7 @@ JOB_PID = "/tmp/zs-job.pid"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 H5 = "https://officialmoviebox.com"           # situs katalog MovieBox
-ALLOW_SUFFIXES = ("hakunaymatata.com",   # CDN MovieBox
-                  "drakor.club")         # mirror file LK21 (Task 96)
+ALLOW_SUFFIXES = ("hakunaymatata.com",)       # host file + subtitle
 FALLBACK_REF = "https://mzfi.me/"             # referer darurat
 CHUNK = 262144                                # 256 KB
 _domain_cache = (None, 0)                     # (nilai, waktu)
