@@ -131,6 +131,40 @@ mengunduh lagi.
 
 ---
 
+## BULK UNDUH SERIES (v1.3 — pilih banyak episode sekaligus)
+
+Serial ratusan episode **tidak perlu dijalankan satu-satu lagi**. Isi input
+baru **`episodes`** dengan daftar/rentang episode, contoh:
+
+- `1-100` → episode 1 sampai 100
+- `1,3,5-8` → episode 1, 3, 5, 6, 7, 8
+- kosongkan → perilaku lama (mode tunggal pakai input `episode`)
+
+Cara kerja di balik layar:
+
+1. Pipeline mengunduh → upload → register **satu per satu otomatis**.
+   Satu episode gagal **tidak** menghentikan sisanya (dicatat di ringkasan;
+   jalankan ulang hanya spec episode yang gagal).
+2. **Chunk otomatis ±2 jam**: run Actions hanya memantau maks ±2 jam, jadi
+   `budget_min` (default 95 menit) — episode yang belum kebagian ditandai
+   `ZS_BULK_REMAIN`, lalu runner **men-dispatch ulang workflow ini sendiri**
+   dengan sisa spec (CODES_PAT → fallback GITHUB_TOKEN). Codespace sengaja
+   **tidak dimatikan** antar-chunk supaya lanjut tanpa boot ulang.
+3. Untuk register otomatis ke katalog, kirim **token scope-series**: di
+   Admin → Server 3 → *Bulk Unduh Series*, token dibuat **tanpa episode**
+   (berlaku seluruh season, TTL 72 jam) dan pipeline mengirim nomor episode
+   di tiap register. (Token per-episode lama tetap didukung.)
+
+Cara paling gampang: **Admin → Server 3 → Bulk Unduh Series** di situs —
+centang episodenya (daftar dari TMDB), sekali klik, kartu itu juga
+menampilkan status run terbaru. Bisa juga lewat tab Actions di sini.
+
+Catatan kuota: 100 episode ≈ 10-20 jam kerja Codespace (dari kuota 60 jam
+mesin/bulan) + ±10 runner jam dari 2.000 menit Actions/bulan — cukup untuk
+±1-2 season besar per bulan.
+
+---
+
 ## Subtitle — cara kerjanya sekarang
 
 - Bahasa subtitle **mengalir sampai situs**: label CC di player = bahasa
