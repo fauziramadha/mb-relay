@@ -53,10 +53,26 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import cryptography.hazmat.primitives.hashes as _hashes
-import cryptography.hazmat.primitives.asymmetric.ec as _ec
-from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+# --- dependensi kripto (ECDSA attest + AES-GCM decrypt) ---
+# Codespace python:3.12 tidak punya paket 'cryptography' bawaan —
+# bootstrap pip sekali (wheel manylinux, tanpa kompilasi, ~5-15 dtk
+# pertama; container mengingatnya sampai rebuild).
+try:
+    import cryptography.hazmat.primitives.hashes as _hashes
+    import cryptography.hazmat.primitives.asymmetric.ec as _ec
+    from cryptography.hazmat.primitives.asymmetric.utils import \
+        decode_dss_signature
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    import subprocess as _sp
+    import sys as _sys
+    _sp.run([_sys.executable, "-m", "pip", "install", "--quiet",
+             "cryptography"], check=True, timeout=300)
+    import cryptography.hazmat.primitives.hashes as _hashes
+    import cryptography.hazmat.primitives.asymmetric.ec as _ec
+    from cryptography.hazmat.primitives.asymmetric.utils import \
+        decode_dss_signature
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
