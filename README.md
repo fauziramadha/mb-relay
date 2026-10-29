@@ -197,6 +197,45 @@ pipeline ini memang on-demand (jalan hanya saat kamu meminta film).
 
 ---
 
+## Dua sumber unduhan: MovieBox & LK21 (v2 — Task 96b, 29 Okt 2026)
+
+Workflow `ZS Download` punya pilihan **`sumber`**: `moviebox` (utama) dan
+`lk21` (katalog Indonesia — hardsub/softsub, judul yang sering tidak ada
+di MovieBox, termasuk film China/Asia terbaru).
+
+**Mengapa LK21 pernah gagal total (run 28-29 Okt):** semua tombol unduhan
+LK21 dibungkus shortlink **ouo.io** yang dilindungi Cloudflare Turnstile —
+mustahil dibuka dari server (exit 1 "no server-exposed host"). Shortener
+serupa juga dipakai Pahe (clk.sh + Turnstile) — jalur unduh situs ID
+memang telah terkunci.
+
+**Jalur keluar (LK21 v2):** player LK21 adalah iframe platform **Byse**
+(`justplay.cam/e/<kode>`) yang *tidak* dibungkus ouo — dan platform itu
+bisa di-resolve 100% dari server:
+
+1. `embed/details` (header `X-Embed-Origin` = halaman LK21) → URL player
+   asli (prefix rotasi per-request, dipakai sebagai `Referer`);
+2. tantangan **PoW** 16-bit (hash custom) dipecahkan `pow-solve.js` (node)
+   / `pow-solve.c` (gcc, dikompilasi otomatis) / fallback Python murni;
+3. **fingerprint viewer** ECDSA P-256 (`access/challenge` →
+   `access/attest`) — dibuat server, diterima (confidence 0.88-0.9),
+   di-cache modul untuk bulk;
+4. `embed/playback` → payload **AES-256-GCM** → didekripsi →
+   `master.m3u8` + grup subtitle **WebVTT "Bahasa Indonesia"**;
+5. segmen `.ts` diunduh 16-thread → disatukan; subtitle VTT → SRT →
+   CC player Abyss + katalog (flow upload/register lama dipertahankan).
+
+HLS Byse dibatasi `sp=4000` (±500 KB/s per koneksi) — film 1.4 GB ±
+25-50 menit. Untuk serial bulk tetap jalan lewat chunk otomatis ±2 jam.
+Paket `cryptography` di-bootstrap otomatis via pip (`--target /tmp`).
+
+**Batas yang diketahui:** resolusi bebas dari Byse embed umumnya 480p
+(varian tertinggi yang mereka ekspos); kualitas `auto/1080/720/360` diabaikan
+untuk Byse. Bila suatu judul tidak punya iframe Byse (jarang), pipeline
+jatuh ke host tanpa-ouo / embed GDrive seperti sebelumnya.
+
+---
+
 ## Troubleshooting
 
 | Gejala | Sebab & solusi |
