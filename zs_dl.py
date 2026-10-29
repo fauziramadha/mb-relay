@@ -55,6 +55,8 @@ import time
 import urllib.parse
 import urllib.request
 
+import lk21  # Task 96 — sumber kedua LK21 (satu repo, ikut git pull codespace)
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 H5 = "https://officialmoviebox.com"
@@ -72,6 +74,7 @@ QUALITY = (os.environ.get("ZS_QUALITY") or "auto").strip().lower()
 SUB_LANG = (os.environ.get("ZS_SUB") or "in_id").strip().lower()
 TOKEN = (os.environ.get("ZS_TOKEN") or "").strip()
 REUSE_SLUG = (os.environ.get("ZS_REUSE_SLUG") or "").strip()
+SOURCE = (os.environ.get("ZS_SOURCE") or "moviebox").strip().lower()  # Task 96: moviebox | lk21
 ABYSS_KEY = os.environ.get("ABYSS_KEY", "")
 ABYSS_EMAIL = os.environ.get("ABYSS_EMAIL", "")
 ABYSS_PASSWORD = os.environ.get("ABYSS_PASSWORD", "")
@@ -91,6 +94,7 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
     SUB_LANG = str(_p.get("sub") or SUB_LANG).strip().lower()
     TOKEN = str(_p.get("token") or TOKEN).strip()
     REUSE_SLUG = str(_p.get("reuse_slug") or REUSE_SLUG).strip()
+    SOURCE = str(_p.get("source") or SOURCE).strip().lower()
     ABYSS_KEY = _p.get("abyss_key") or ABYSS_KEY
     ABYSS_EMAIL = _p.get("abyss_email") or ABYSS_EMAIL
     ABYSS_PASSWORD = _p.get("abyss_password") or ABYSS_PASSWORD
@@ -101,6 +105,8 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
 
 if SUB_LANG in ("none", "no", "off", "tanpa", "-"):
     SUB_LANG = ""
+if SOURCE not in ("moviebox", "lk21"):
+    SOURCE = "moviebox"
 MB_UUID = str(__import__("uuid").uuid4())
 MB_STRAT_OK = None
 MB_DIAG = []
@@ -801,6 +807,305 @@ def run_bulk(domain, dp, sel, is_tv, eps):
         sys.exit(1)
 
 
+# ================= SOURCE LK21 (Task 96) =================
+# ZeeStream punya 2 sumber: MovieBox (utama, subtitle resmi) & LK21
+# (alternatif — katalog Indonesia, subtitle hardsub/SRT situs).
+# Seluruh tahap upload Abyss + register + CC native DIPAKAI BERSAMA.
+
+def lk21_download(got, out_name):
+    """Kaskade strategi unduh zs_dl utk URL LK21 (referer khusus per host).
+    Return True bila file lengkap (target size bila diketahui)."""
+    ref = got.get("referer") or "https://tv.nontonfilm.red/"
+    target = int(got.get("size") or 0)
+    base = {"User-Agent": UA, "Referer": ref,
+            "Accept": "*/*"}
+    order = (["urllib", "curl-h2", "wget"] if not MB_STRAT_OK
+             else [MB_STRAT_OK, "urllib", "curl-h2", "wget"])
+    seen = set()
+    for name in order:
+        if name in seen:
+            continue
+        seen.add(name)
+        hdrs = dict(base)
+        probe = _probe_curl if name in ("curl-h2", "wget") else _probe_urllib
+        dl = {"urllib": _dl_urllib, "curl-h2": _dl_curl,
+              "wget": _dl_wget}[name]
+        code, ctype, body = probe(got["url"], hdrs)
+        if code in (200, 206) and (
+                "video" in (ctype or "").lower()
+                or "mp4" in (ctype or "").lower()
+                or "octet-stream" in (ctype or "").lower()
+                or (name == "wget" and code == 200)):
+            ok, msg = dl(got["url"], hdrs, out_name, target)
+            if ok:
+                MB_STRAT_OK = name if name in (
+                    "urllib", "curl-h2", "wget") else MB_STRAT_OK
+                say(f"   SELESAI via [{name}]: {out_name} "
+                    f"({os.path.getsize(out_name)/1e6:.0f} MB)")
+                return True
+            say(f"   [{name}] unduh putus — {msg}")
+        else:
+            snip = (body or b"")[:120].decode("utf-8", "replace").replace(
+                "\n", " ").strip()
+            say(f"   [{name}] HTTP {code} {ctype or ''} {snip}")
+    return False
+
+
+def lk21_process_one(dom, sel, ep, is_tv):
+    """LK21 satu target: resolve → unduh → sub SRT → upload → register.
+    Return dict hasil (tidak sys.exit — pemanggil melanjutkan)."""
+    judul, tahun = sel.get("title") or "film", sel.get("year") or ""
+    slug_page = re.sub(r"-episode-\d+$", "", sel["slug"])
+    try:
+        if is_tv:
+            det = lk21.lk_detail(f"{slug_page}-episode-{ep}", dom)
+        else:
+            det = lk21.lk_detail(sel["slug"], dom)
+    except Exception as e:
+        return {"ep": ep, "ok": False,
+                "error": f"halaman detail gagal: {repr(e)[:100]}"}
+    got = lk21.resolve_from_detail(
+        det, QUALITY, log=lambda *a: say("  ", *a))
+    if not got:
+        return {"ep": ep, "ok": False,
+                "error": "tak ada host LK21 yang terekspos server-side "
+                         "(ouo murni/JS-gated) — coba sumber MovieBox"}
+    try:
+        res = int(str(got.get("quality") or "0").replace("p", "")) or 720
+    except ValueError:
+        res = 720
+    size_est = int(got.get("size") or 0)
+    if is_tv:
+        FILE = f"{judul} S{SEASON:02d}E{ep:02d} [{res}p].mp4"
+    else:
+        FILE = f"{judul} ({tahun}) [{res}p].mp4"
+    FILE = re.sub(r'[<>:"/\\|?*]', "", FILE).strip()
+    say(f"  {FILE} — dari {got['source_page'][:70]}")
+    say(f"   unduh {res}p " +
+        (f"≈{size_est/1e6:.0f} MB" if size_est else "(ukuran tak diketahui)")
+        + "…")
+
+    if size_est * 1.15 > shutil.disk_usage(".").free:
+        return {"ep": ep, "ok": False,
+                "error": f"disk kurang (butuh ≈{size_est*1.15/1e9:.1f} GB)"}
+
+    if not lk21_download(got, FILE):
+        try:
+            os.remove(FILE)
+        except OSError:
+            pass
+        return {"ep": ep, "ok": False, "error": "unduh gagal semua strategi"}
+    size = os.path.getsize(FILE)
+    say(f"  unduh OK ({size/1e6:.0f} MB) — subtitle…")
+
+    # subtitle SRT LK21 (bila link terbocor dari shortlink)
+    sub_text, sub_lan = None, None
+    sub_url = got.get("sub_url")
+    if sub_url and SUB_LANG:
+        try:
+            raw = lk21.lk_http(sub_url, timeout=60).read()
+            sub_text = raw.decode("utf-8-sig", "replace")
+            if "-->" not in sub_text:
+                sub_text = None
+            else:
+                sub_lan = "Indonesia"
+                say(f"  subtitle LK21: {len(sub_text)} karakter")
+        except Exception as e:
+            say("  subtitle LK21 dilewati:", repr(e)[:80])
+    elif SUB_LANG:
+        say("  subtitle SRT LK21 tidak terbuka (shortlink) — file LK21 "
+            "umumnya sudah hardsub Indonesia")
+
+    # upload ke Abyss (3x) — logika sama dgn jalur MovieBox
+    say("  upload ke Abyss…")
+    up = None
+    for attempt in range(3):
+        cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
+               "2048", "--speed-time", "120",
+               "-F", f"file=@{FILE};type=video/mp4",
+               f"https://up.abyss.to/{ABYSS_KEY}"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, timeout=7300)
+        except subprocess.TimeoutExpired:
+            p = None
+        if p is not None:
+            try:
+                up = json.loads(p.stdout or b"{}")
+            except Exception:
+                up = None
+        if isinstance(up, dict) and up.get("status"):
+            break
+        up = None
+        time.sleep(10)
+    if not (isinstance(up, dict) and up.get("status")):
+        try:
+            os.remove(FILE)
+        except OSError:
+            pass
+        return {"ep": ep, "ok": False,
+                "error": f"upload Abyss ditolak ({up or 'tanpa jawaban'})"}
+    slug = up["slug"]
+    try:
+        os.remove(FILE)
+    except OSError:
+        pass
+    say(f"  upload OK: slug {slug} — file lokal dihapus")
+
+    reg = register_one(slug, ep if is_tv else 1, res, size,
+                       sub_text, sub_lan, is_tv)
+    r = {"ep": ep, "ok": True, "slug": slug, "res": res, "size": size,
+         "sub_lan": sub_lan,
+         "reg_ok": bool(reg.get("ok")) and not reg.get("skip"),
+         "reg_skip": reg.get("skip"),
+         "reg_error": None if reg.get("ok") else str(reg.get("error"))[:160]}
+    if reg.get("retry"):
+        r["reg_pending"] = True
+        r["sub_text"] = sub_text
+    else:
+        say("  register:", "OK" if reg.get("ok")
+            else f"GAGAL — {str(reg.get('error'))[:120]}")
+
+    global ABYSS_JWT
+    if sub_text and ABYSS_EMAIL and ABYSS_PASSWORD:
+        try:
+            if ABYSS_JWT is None:
+                ABYSS_JWT = abyss_login(ABYSS_EMAIL, ABYSS_PASSWORD)
+            if ABYSS_JWT:
+                lang = (sub_lan or "Indonesia").strip()
+                code = abyss_put_subtitle(
+                    ABYSS_JWT, slug, lang, f"{lang_slug(lang)}.vtt",
+                    srt_to_vtt(sub_text))
+                r["sub_player_ok"] = code == 200
+        except Exception as e:
+            say("  CC player Abyss dilewati:", repr(e)[:90])
+    return r
+
+
+def run_bulk_lk21(dom, sel, eps):
+    """Bulk LK21 (series): pola sama dgn run_bulk MovieBox — satu episode
+    per iterasi + budget chunk + marker ZS_BULK_REMAIN utk chunk lanjutan."""
+    judul = sel.get("title") or "series"
+    se = SEASON
+    say(f"\nMODE BULK LK21: {len(eps)} episode (S{se}, judul '{judul}') — "
+        f"budget chunk {BUDGET_MIN} menit")
+    summary_line(f"- Mode: **BULK LK21** — {len(eps)} episode S{se} "
+                 f"(chunk ±{BUDGET_MIN} menit)")
+    results, remaining, t0 = [], [], time.time()
+    for i, ep in enumerate(eps):
+        if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
+            remaining = eps[i:]
+            say(f"\n⏸ Budget chunk tercapai ({BUDGET_MIN} mnt) — "
+                f"{len(remaining)} episode ditunda ke chunk berikutnya.")
+            break
+        say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
+        try:
+            r = lk21_process_one(dom, sel, ep, True)
+        except Exception as e:
+            r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
+        results.append(r)
+        if r.get("ok"):
+            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}")
+        else:
+            say(f"  ✘ E{ep} GAGAL: {r.get('error')}")
+
+    pend = [r for r in results if r.get("reg_pending")]
+    for r in pend:
+        reg = register_one(r["slug"], r["ep"], r["res"], r["size"],
+                           r.get("sub_text"), r.get("sub_lan"), True,
+                           retries=3)
+        r["reg_ok"] = bool(reg.get("ok"))
+        r.pop("reg_pending", None)
+        r.pop("sub_text", None)
+        r["reg_error"] = None if reg.get("ok") else str(reg.get("error"))[:160]
+        say(f"  register ulang E{r['ep']}: "
+            + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+
+    ok_n = sum(1 for r in results if r.get("ok"))
+    reg_n = sum(1 for r in results if r.get("reg_ok"))
+    fail_n = len(results) - ok_n
+    say("\n" + "=" * 58)
+    say(f"BULK LK21: {ok_n} episode terupload OK, {reg_n} terdaftar, "
+        f"{fail_n} gagal" + (f", {len(remaining)} ditunda" if remaining else ""))
+    for r in results:
+        if r.get("ok"):
+            say(f"  E{r['ep']}: OK slug={r.get('slug')} {r.get('res')}p")
+        else:
+            say(f"  E{r['ep']}: GAGAL — {r.get('error')}")
+    summary_line(f"- Hasil chunk LK21: {ok_n} upload OK, {reg_n} register OK, "
+                 f"{fail_n} gagal")
+    if remaining:
+        spec = build_episode_spec(remaining)
+        say(f"\nSISA {len(remaining)} episode → chunk berikutnya otomatis.")
+        say(f"ZS_BULK_REMAIN:{spec}")
+        summary_line(f"- Chunk berikutnya (otomatis): episodes `{spec}`")
+    say("=" * 58)
+    if results and ok_n == 0 and not remaining:
+        sys.exit(1)
+
+
+def main_lk21():
+    """Alur sumber LK21: cari → pilih → (film | series tunggal/bulk)."""
+    if REUSE_SLUG:
+        fail("slug_lama (register-saja) hanya untuk sumber moviebox — "
+             "LK21 tidak punya koneksi slug lama.")
+    egress = mb_ip()
+    say(f"ZS pipeline — SUMBER LK21\nIP egress: {egress}\n")
+    summary_line(f"# ZS Download (LK21) — {TITLE}")
+    summary_line(f"- IP runner: `{egress}` | sumber: LK21")
+    dom = lk21.lk_domain()
+    results = lk21.lk_search(TITLE, dom)
+    if not results:
+        fail(f"Tidak ada hasil '{TITLE}' di LK21 — coba kata kunci lain "
+             "atau jalankan dengan sumber moviebox.")
+    say(f"Hasil pencarian LK21 '{TITLE}': {len(results)} judul")
+    listing = ["\n## Hasil pencarian LK21\n"]
+    for i, it in enumerate(results[:20]):
+        line = f"[{i:>2}] {it.get('title', '?')} ({it.get('year', '-')})"
+        say("  " + line)
+        listing.append(f"- `{i}` **{it.get('title', '?')}** "
+                       f"({it.get('year', '-')})")
+    summary_line("\n".join(listing))
+    if PICK < 0 or PICK >= len(results):
+        fail(f"Pilihan indeks {PICK} di luar daftar LK21 "
+             f"(0..{len(results)-1}) — lihat daftar di atas.")
+    sel = results[PICK]
+    say(f"\nTerpilih: {sel['title']} ({sel['year']})")
+
+    # deteksi series dari link episode di halaman detail
+    base_det = lk21.lk_detail(sel["slug"], dom)
+    is_tv = bool(base_det["episode_links"])
+    say("Tipe:", "SERIES" if is_tv else "Film")
+
+    if EPISODES_SPEC:
+        if not is_tv:
+            fail("Input 'episodes' (bulk) hanya untuk SERIES — pilih "
+                 "hasil bertipe series (punya halaman episode di LK21).")
+        try:
+            eps = parse_episode_spec(EPISODES_SPEC)
+        except ValueError as e:
+            fail(f"Input 'episodes' tidak valid: {e}")
+        run_bulk_lk21(dom, sel, eps)
+        return
+
+    ep = EPISODE if is_tv else 1
+    r = lk21_process_one(dom, sel, ep, is_tv)
+    if not r.get("ok"):
+        fail(f"Gagal: {r.get('error')} — LK21 punya batasan host; "
+             "coba sumber moviebox untuk judul ini.")
+    if r.get("reg_pending"):
+        reg = register_one(r["slug"], r["ep"], r["res"], r["size"],
+                           r.get("sub_text"), r.get("sub_lan"), is_tv,
+                           retries=3)
+        r["reg_ok"] = bool(reg.get("ok"))
+    say("\n" + "=" * 58)
+    if r.get("reg_ok"):
+        say("SUKSES! Judul TERSEDIA di Server 3 situs (sumber LK21).")
+    else:
+        say(f"SELESAI (upload OK). Slug: {r.get('slug')} — register: "
+            f"{r.get('reg_error') or 'token kosong/lupa'}")
+    say("=" * 58)
+
+
 def main():
     if not TITLE:
         fail("Input 'judul' kosong — isi kata kunci pencarian.")
@@ -808,6 +1113,8 @@ def main():
         fail("Secret ABYSS_KEY belum diset di repo.")
     if EPISODES_SPEC and REUSE_SLUG:
         fail("Input 'episodes' (bulk) tidak bisa dipakai bersama 'slug_lama' ")
+    if SOURCE == "lk21":
+        return main_lk21()
 
     egress = mb_ip()
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")

@@ -13,6 +13,14 @@ on:
       judul:
         description: "Judul film/serial (kata kunci pencarian; Inggris lebih akurat)"
         required: true
+      sumber:
+        description: "Sumber unduhan (Task 96)"
+        required: false
+        default: "moviebox"
+        type: choice
+        options:
+          - moviebox
+          - lk21
       pilihan:
         description: "Indeks hasil pencarian kalau ada beberapa (default 0)"
         required: false
@@ -72,6 +80,7 @@ jobs:
       - name: Susun parameter (JSON)
         env:
           I_JUDUL: ${{ inputs.judul }}
+          I_SUMBER: ${{ inputs.sumber }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
           I_EPISODE: ${{ inputs.episode }}
@@ -89,6 +98,7 @@ jobs:
           import json, os
           p = {
               "title": os.environ["I_JUDUL"],
+              "source": (os.environ["I_SUMBER"] or "moviebox").strip(),
               "pick": int(os.environ["I_PICK"] or 0),
               "se": int(os.environ["I_MUSIM"] or 1),
               "ep": int(os.environ["I_EPISODE"] or 1),
@@ -106,7 +116,7 @@ jobs:
           with open(path, "w") as f:
               json.dump(p, f)
           mode = f"BULK {p['episodes']}" if p["episodes"] else f"tunggal S{p['se']}E{p['ep']}"
-          print(f"params siap — judul: {p['title']} | mode: {mode} | kualitas: {p['quality']}")
+          print(f"params siap — sumber: {p['source']} | judul: {p['title']} | mode: {mode} | kualitas: {p['quality']}")
           PY
 
       - name: Cari Codespace relay mb-relay
@@ -298,6 +308,7 @@ jobs:
         env:
           REMAIN: ${{ steps.monitor.outputs.remain }}
           I_JUDUL: ${{ inputs.judul }}
+          I_SUMBER: ${{ inputs.sumber }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
           I_BUDGET: ${{ inputs.budget_menit }}
@@ -311,6 +322,7 @@ jobs:
           REPO = "fauziramadha/mb-relay"
           inputs = {
               "judul": os.environ["I_JUDUL"],
+              "sumber": os.environ["I_SUMBER"] or "moviebox",
               "pilihan": os.environ["I_PICK"] or "0",
               "musim": os.environ["I_MUSIM"] or "1",
               "episode": "1",
