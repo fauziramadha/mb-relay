@@ -29,6 +29,10 @@ on:
         description: "BULK series: daftar/rentang episode, mis. 1-100 / 1,3,5-8 (kosong = mode tunggal input episode). Di-chunk otomatis ±2 jam per run"
         required: false
         default: ""
+      budget_menit:
+        description: "Soft-budget menit per chunk bulk (default 95; kecil = chunk pendek utk tes)"
+        required: false
+        default: "95"
       kualitas:
         description: "auto / 1080 / 720 / 360 (default auto = tertinggi gratis)"
         required: false
@@ -72,6 +76,7 @@ jobs:
           I_MUSIM: ${{ inputs.musim }}
           I_EPISODE: ${{ inputs.episode }}
           I_EPISODES: ${{ inputs.episodes }}
+          I_BUDGET: ${{ inputs.budget_menit }}
           I_KUALITAS: ${{ inputs.kualitas }}
           I_SUBTITLE: ${{ inputs.subtitle }}
           I_TOKEN: ${{ inputs.token }}
@@ -88,7 +93,7 @@ jobs:
               "se": int(os.environ["I_MUSIM"] or 1),
               "ep": int(os.environ["I_EPISODE"] or 1),
               "episodes": os.environ["I_EPISODES"] or "",
-              "budget_min": 95,
+              "budget_min": int(os.environ["I_BUDGET"] or 0) or 95,
               "quality": os.environ["I_KUALITAS"] or "auto",
               "sub": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
@@ -295,6 +300,7 @@ jobs:
           I_JUDUL: ${{ inputs.judul }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
+          I_BUDGET: ${{ inputs.budget_menit }}
           I_KUALITAS: ${{ inputs.kualitas }}
           I_SUBTITLE: ${{ inputs.subtitle }}
           I_TOKEN: ${{ inputs.token }}
@@ -309,6 +315,7 @@ jobs:
               "musim": os.environ["I_MUSIM"] or "1",
               "episode": "1",
               "episodes": os.environ["REMAIN"],
+              "budget_menit": os.environ["I_BUDGET"] or "95",
               "kualitas": os.environ["I_KUALITAS"] or "auto",
               "subtitle": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
