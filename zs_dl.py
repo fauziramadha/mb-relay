@@ -578,6 +578,101 @@ def build_episode_spec(eps):
     return ",".join(parts)
 
 
+# ---------------------------------------------------------------------
+#  Upload Abyss v2 (Task 96c, 30 Okt): rotasi endpoint + guard sabar +
+#  pemulihan "semua byte terkirim tapi jawaban tak datang".
+#  Latar: ingress up.abyss.to sempat dicekik <2 KB/dtk (Warkop 3,13 GB
+#  gagal 2 run beruntun) sementara ingress kembar up.hydrax.net terukur
+#  6x lebih cepat (796 vs 136 KB/dtk) dengan kunci sama; server juga
+#  kadang MENERIMA file penuh tapi tak menjawab dalam jendela curl
+#  (kasus nyata: 64 MB "timeout" ternyata tersimpan, status Waiting)
+#  → pulihkan via katalog api.hydrax.net/{KEY}/list.
+# ---------------------------------------------------------------------
+ABYSS_UP_ENDPOINTS = (
+    "http://up.hydrax.net",    # tercepat terukur (HTTP)
+    "https://up.hydrax.net",   # fallback TLS
+    "https://up.abyss.to",     # ingress klasik
+)
+
+
+def abyss_list_items():
+    """Katalog file akun Abyss (curl + UA; urllib ditolak CF)."""
+    out, page = [], 1
+    for _ in range(20):
+        try:
+            p = subprocess.run(
+                ["curl", "-sS", "--max-time", "60", "-A", UA,
+                 f"https://api.hydrax.net/{ABYSS_KEY}/list?page={page}"],
+                capture_output=True, timeout=75)
+            d = json.loads(p.stdout or b"{}")
+        except Exception:
+            break
+        items = d.get("items") or []
+        out += items
+        nxt = int((d.get("pagination") or {}).get("next") or 0)
+        if not items or not nxt or nxt <= page:
+            break
+        page = nxt
+    return out
+
+
+def abyss_upload(file_path, log=lambda s: None):
+    """Upload 1 file ke Abyss → dict {status,slug,urlIframe} atau None.
+    - rotasi endpoint (hydrax HTTP → hydrax TLS → abyss klasik)
+    - guard kematian: putus hanya bila <2 KB/dtk selama 5 MENIT
+    - jatah waktu dinamis per ukuran (asumsi pesimistis 350 KB/dtk)
+    - pemulihan: bila SEMUA byte terkirim tanpa jawaban, cari slug
+      baru di katalog (server lambat memproses ≠ upload gagal)
+    """
+    size = os.path.getsize(file_path)
+    base = os.path.basename(file_path)
+    pre = {it.get("slug") for it in abyss_list_items()}
+    # jatah waktu per endpoint (mnt): utama longgar, fallback mengecil —
+    # total terburuk ±2 jam utk memberi ruang rotasi dalam jendela run
+    for ep, win in zip(ABYSS_UP_ENDPOINTS, (4800, 1800, 900)):
+        max_time = min(max(int(size / (350 * 1024)) + 900, 900), win)
+        resp = "/tmp/zs-abyss-resp.json"
+        cmd = ["curl", "-sS", "-A", UA, "--max-time", str(max_time),
+               "--speed-limit", "2048", "--speed-time", "300",
+               "-o", resp, "-w", "%{size_upload} %{http_code}",
+               "-F", f"file=@{file_path};type=video/mp4",
+               f"{ep}/{ABYSS_KEY}"]
+        log(f"  upload via {ep} (jatah {max_time // 60} mnt)…")
+        try:
+            p = subprocess.run(cmd, capture_output=True,
+                               timeout=max_time + 120)
+        except subprocess.TimeoutExpired:
+            p = None
+        up, sent = None, 0
+        if p is not None:
+            w = (p.stdout or b"").decode().split()
+            sent = int(w[0]) if w and w[0].isdigit() else 0
+            try:
+                up = json.loads(open(resp, encoding="utf-8").read())
+            except Exception:
+                up = None
+        if isinstance(up, dict) and up.get("status") and up.get("slug"):
+            return up
+        if sent >= size:
+            log(f"  {sent/1e6:.0f} MB terkirim penuh tanpa jawaban — "
+                "poll katalog (server sedang memproses)…")
+            for _ in range(8):
+                time.sleep(60)
+                for it in abyss_list_items():
+                    isz = int(it.get("size") or 0)
+                    if (it.get("slug") not in pre
+                            and it.get("name") == base
+                            and isz and abs(isz - size) / size < 0.05):
+                        log(f"  PEMULIHAN OK: slug {it['slug']} "
+                            "muncul di katalog")
+                        return {"status": True, "slug": it["slug"],
+                                "urlIframe": ("https://player."
+                                              f"abyssplayer.com/{it['slug']}")}
+        log(f"  gagal via {ep} (exit {p.returncode if p else 'TO'}, "
+            f"{sent/1e6:.0f}/{size/1e6:.0f} MB) — endpoint berikutnya…")
+    return None
+
+
 def register_one(slug, ep, res, size, sub_text, sub_lan, is_tv, retries=4):
     """Register SATU episode ke katalog situs. Body membawa 'episode' —
     dipakai token scope-series; token per-episode mengabaikannya (aman).
@@ -660,27 +755,9 @@ def process_episode(domain, dp, se, ep, judul, tahun, is_tv):
         except Exception as e:
             say("  subtitle dilewati:", repr(e)[:90])
 
-    # upload ke Abyss (3x percobaan)
-    say(f"  upload ke Abyss…")
-    up = None
-    for attempt in range(3):
-        cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
-               "2048", "--speed-time", "120",
-               "-F", f"file=@{FILE};type=video/mp4",
-               f"https://up.abyss.to/{ABYSS_KEY}"]
-        try:
-            p = subprocess.run(cmd, capture_output=True, timeout=7300)
-        except subprocess.TimeoutExpired:
-            p = None
-        if p is not None:
-            try:
-                up = json.loads(p.stdout or b"{}")
-            except Exception:
-                up = None
-        if isinstance(up, dict) and up.get("status"):
-            break
-        up = None
-        time.sleep(10)
+    # upload ke Abyss (Task 96c: rotasi endpoint + pemulihan katalog)
+    say("  upload ke Abyss…")
+    up = abyss_upload(FILE, log=say)
     if not (isinstance(up, dict) and up.get("status")):
         try:
             os.remove(FILE)
@@ -973,27 +1050,9 @@ def lk21_process_one(dom, sel, ep, is_tv):
                 say("  tanpa subtitle terpisah — isi Byse umumnya punya "
                     "track Indonesia di player")
 
-    # upload ke Abyss (3x) — logika sama dgn jalur MovieBox
+    # upload ke Abyss (Task 96c: rotasi endpoint + pemulihan katalog)
     say("  upload ke Abyss…")
-    up = None
-    for attempt in range(3):
-        cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
-               "2048", "--speed-time", "120",
-               "-F", f"file=@{FILE};type=video/mp4",
-               f"https://up.abyss.to/{ABYSS_KEY}"]
-        try:
-            p = subprocess.run(cmd, capture_output=True, timeout=7300)
-        except subprocess.TimeoutExpired:
-            p = None
-        if p is not None:
-            try:
-                up = json.loads(p.stdout or b"{}")
-            except Exception:
-                up = None
-        if isinstance(up, dict) and up.get("status"):
-            break
-        up = None
-        time.sleep(10)
+    up = abyss_upload(FILE, log=say)
     if not (isinstance(up, dict) and up.get("status")):
         try:
             os.remove(FILE)
@@ -1321,28 +1380,7 @@ def main():
         if not os.path.exists(FILE):
             fail("File hilang setelah unduh — error aneh, cek log.")
         say(f"\nMengunggah {FILE} ({size/1e9:.2f} GB) ke Abyss…")
-        up = None
-        for attempt in range(3):
-            cmd = ["curl", "-sS", "--max-time", "7200", "--speed-limit",
-                   "2048", "--speed-time", "120",
-                   "-F", f"file=@{FILE};type=video/mp4",
-                   f"https://up.abyss.to/{ABYSS_KEY}"]
-            try:
-                p = subprocess.run(cmd, capture_output=True, timeout=7300)
-            except subprocess.TimeoutExpired:
-                p = None
-            if p is not None:
-                try:
-                    up = json.loads(p.stdout or b"{}")
-                except Exception:
-                    up = None
-            if isinstance(up, dict) and up.get("status"):
-                break
-            say(f"  percobaan {attempt + 1}/3 gagal: "
-                f"exit {p.returncode if p else 'timeout'} "
-                f"{((p.stderr or b'')[:150]) if p else b''}")
-            up = None
-            time.sleep(10)
+        up = abyss_upload(FILE, log=say)
         if not (isinstance(up, dict) and up.get("status")):
             fail(f"Upload Abyss ditolak: {up or 'tidak ada jawaban JSON'}")
         slug = up["slug"]

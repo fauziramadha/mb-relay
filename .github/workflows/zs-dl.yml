@@ -65,7 +65,7 @@ concurrency:
 jobs:
   unduh:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 200
     # Task 92: actions:write → runner bisa men-dispatch chunk berikutnya
     # via GITHUB_TOKEN (fallback bila CODES_PAT gagal); contents:read utk checkout
     permissions:
@@ -266,9 +266,10 @@ jobs:
           print("pekerjaan dimulai:", r)
           assert r.get("started"), f"jobstart gagal: {r}"
 
-          # 3. pantau log sampai selesai (maks 2 jam); log penuh ditampung
-          #    untuk deteksi marker sisa episode bulk (Task 92)
-          off, deadline, exit_code = 0, time.time() + 7200, None
+          # 3. pantau log sampai selesai (maks 2,5 jam — Task 96c: upload
+          #    Abyss kini rotasi-endpoint, file besar butuh ruang); log
+          #    penuh ditampung untuk deteksi marker sisa episode bulk (Task 92)
+          off, deadline, exit_code = 0, time.time() + 9000, None
           full_log = ""
           while time.time() < deadline:
               j = get(f"/joblog?from={off}")
@@ -283,7 +284,7 @@ jobs:
                   break
               time.sleep(10)
           if exit_code is None:
-              raise SystemExit("pekerjaan tidak selesai dalam 2 jam / "
+              raise SystemExit("pekerjaan tidak selesai dalam 2,5 jam / "
                                "log terputus")
           print(f"\n== exit code codespace: {exit_code} ==")
 
