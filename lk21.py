@@ -55,8 +55,10 @@ import urllib.request
 
 # --- dependensi kripto (ECDSA attest + AES-GCM decrypt) ---
 # Codespace python:3.12 tidak punya paket 'cryptography' bawaan —
-# bootstrap pip sekali (wheel manylinux, tanpa kompilasi, ~5-15 dtk
-# pertama; container mengingatnya sampai rebuild).
+# bootstrap pip sekali (--target folder tetap; path user-site dibuat
+# TERLALU AKHIR oleh interpreter jadi harus di-insert manual).
+# Wheel manylinux, tanpa kompilasi, ~5-15 dtk pertama saja.
+_PYDEPS = "/tmp/zs-pydeps"
 try:
     import cryptography.hazmat.primitives.hashes as _hashes
     import cryptography.hazmat.primitives.asymmetric.ec as _ec
@@ -66,8 +68,15 @@ try:
 except ImportError:
     import subprocess as _sp
     import sys as _sys
-    _sp.run([_sys.executable, "-m", "pip", "install", "--quiet",
-             "cryptography"], check=True, timeout=300)
+    if not os.path.exists(os.path.join(_PYDEPS, "cryptography")):
+        r = _sp.run([_sys.executable, "-m", "pip", "install", "--quiet",
+                     "--target", _PYDEPS, "cryptography"],
+                    timeout=300, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError("pip install cryptography gagal: "
+                               + (r.stderr or r.stdout)[-400:])
+    if _PYDEPS not in _sys.path:
+        _sys.path.insert(0, _PYDEPS)
     import cryptography.hazmat.primitives.hashes as _hashes
     import cryptography.hazmat.primitives.asymmetric.ec as _ec
     from cryptography.hazmat.primitives.asymmetric.utils import \
