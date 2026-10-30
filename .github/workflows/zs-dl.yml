@@ -14,13 +14,27 @@ on:
         description: "Judul film/serial (kata kunci pencarian; Inggris lebih akurat)"
         required: true
       sumber:
-        description: "Sumber unduhan (Task 96)"
+        description: "Sumber unduhan (Task 96 + 97)"
         required: false
         default: "moviebox"
         type: choice
         options:
           - moviebox
           - lk21
+          - manual
+      link:
+        description: "[manual] Link file final: Google Share/Mega/URL mp4 — dari halaman download LK21 (dadadidi.de)"
+        required: false
+        default: ""
+      tipe:
+        description: "[manual] movie / tv (bentuk nama file + register episode)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - movie
+          - tv
       pilihan:
         description: "Indeks hasil pencarian kalau ada beberapa (default 0)"
         required: false
@@ -81,6 +95,8 @@ jobs:
         env:
           I_JUDUL: ${{ inputs.judul }}
           I_SUMBER: ${{ inputs.sumber }}
+          I_LINK: ${{ inputs.link }}
+          I_TIPE: ${{ inputs.tipe }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
           I_EPISODE: ${{ inputs.episode }}
@@ -99,6 +115,8 @@ jobs:
           p = {
               "title": os.environ["I_JUDUL"],
               "source": (os.environ["I_SUMBER"] or "moviebox").strip(),
+              "link": os.environ["I_LINK"] or "",
+              "tipe": os.environ["I_TIPE"] or "",
               "pick": int(os.environ["I_PICK"] or 0),
               "se": int(os.environ["I_MUSIM"] or 1),
               "ep": int(os.environ["I_EPISODE"] or 1),
