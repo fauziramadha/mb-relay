@@ -44,6 +44,7 @@
 #   - MODE REGISTER-SAJA via input slug_lama: film sudah ada di Abyss
 #     (mis. run lalu lupa isi token) → register TANPA unduh/upload.
 #   - register retry saat jawaban "still processing" (202).
+import base64
 import glob
 import json
 import os
@@ -1448,14 +1449,31 @@ def mega_parse(link):
     return None, None
 
 
-def mega_api(payload):
-    """Satu panggilan API Mega (w) → elemen pertama. Error = int negatif."""
+def mega_api(payload, fid=None):
+    """Satu panggilan API Mega (/cs) → elemen pertama. Error = int negatif.
+    Task 98: endpoint lama /w kini menjawab KOSONG (MEGA menutupnya —
+    run user 30 Okt crash JSONDecodeError); endpoint hidup =
+    POST /cs?id=1&n={fid}. PENTING: minta URL unduh dgn {"g":1} TANPA
+    "v":2 — flag v:2 mengaktifkan mode msd (multi-source: array 6 URL
+    segmen ±156 MB yang mustahil dipakai langsung); tanpa v:2 server
+    memberi SATU URL file penuh (terverifikasi: CL == size, Range OK,
+    dekrip CTR byte-0 = header ZIP 'PK' 0x03 0x04)."""
+    url = "https://g.api.mega.co.nz/cs?id=1"
+    if fid:
+        url += "&n=" + urllib.parse.quote(fid)
     req = urllib.request.Request(
-        "https://g.api.mega.co.nz/w",
-        data=json.dumps([payload]).encode(), method="POST",
+        url, data=json.dumps([payload]).encode(), method="POST",
         headers={"Content-Type": "application/json", "User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=90) as r:
-        d = json.loads(r.read().decode("utf-8", "replace"))
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        raise RuntimeError(f"API Mega tak terjangkau: {repr(e)[:100]}")
+    try:
+        d = json.loads(raw)
+    except Exception:
+        raise RuntimeError("API Mega menjawab bukan-JSON ('"
+                           + raw[:60].replace("\n", " ") + "')")
     if isinstance(d, list):
         if d and isinstance(d[0], int) and d[0] < 0:
             return d[0]
@@ -1471,26 +1489,47 @@ def mega_resolve(link, log=None):
     if not fid:
         raise RuntimeError("link Mega tidak dikenali / tanpa kunci #… — "
                            "salin link utuh dari portal (mega.nz/file/…#…)")
-    info = mega_api({"a": "g", "p": fid, "ssl": 1})
+    info = mega_api({"a": "g", "g": 1, "p": fid, "ssl": 2}, fid=fid)
     if isinstance(info, int):
         raise RuntimeError(_MEGA_ERR.get(info, f"Mega error {info}"))
+    if isinstance(info, dict) and isinstance(info.get("g"), list):
+        info["g"] = info["g"][0] if info["g"] else None  # Task 98: g = array
     if not isinstance(info, dict) or not info.get("g"):
-        raise RuntimeError("Mega tidak memberi URL unduh (file mati?)")
+        raise RuntimeError("Mega tidak memberi URL unduh (file mati / "
+                           "kuota habis — coba link host lain)")
     raw = _mega_b64d(key_b64)
     if len(raw) != 32:
         raise RuntimeError(f"kunci Mega aneh ({len(raw)} byte)")
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    unw = Cipher(algorithms.AES(raw), modes.ECB()).decryptor().update(raw)
-    key, nonce = unw[:16], unw[16:24]
+    # Task 98 — algoritma resmi (diverifikasi vs megajs + data nyata):
+    # kunci file 16 byte = XOR dua half kunci URL; nonce CTR = byte
+    # 16-24 kunci URL (half MAC — tak tersentuh unwrap). Kode lama
+    # memakai AES-256-ECB self-decrypt → kunci/nonce SALAH → file hasil
+    # dekrip berisi sampah (belum pernah tervalidasi dgn file nyata).
+    key = bytes(a ^ b for a, b in zip(raw[:16], raw[16:32]))
+    nonce = raw[16:24]
     name = None
     try:
         at = _mega_b64d(info.get("at") or "")
-        dec = Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(at)
+        # atribut = AES-128-CBC, IV nol, tanpa padding (bukan ECB —
+        # blok-1 memang identik ECB itulah kenapa prefix MEGA{ dulu
+        # "kelihatan benar" lalu sisanya rusak)
+        dec = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16)) \
+            .decryptor().update(at)
         blob = dec.split(b"\x00")[0].decode("utf-8", "replace").strip()
-        meta = json.loads(blob[4:] if blob.startswith("MEGA") else blob)
+        if blob.startswith("MEGA"):
+            blob = blob[4:]
+        meta = json.loads(blob) if blob.startswith("{") else {}
         name = str(meta.get("n") or meta.get("name") or "") or None
     except Exception:
         pass
+    if not name:
+        try:
+            m = re.search(rb'"n"\s*:\s*"((?:[^"\\]|\\.)*)"', dec)
+            if m:
+                name = m.group(1).decode("utf-8", "replace")
+        except Exception:
+            pass
     if log and name:
         log(f"  Mega: file '{name[:60]}' "
             f"({int(info.get('s') or 0)/1e6:.0f} MB)")
@@ -1537,90 +1576,326 @@ def mega_download(link, out_name, log=lambda s: None):
     return r.get("name")
 
 
+def manual_parse_links(raw):
+    """Task 98 — pecah input link JAMAK (newline / spasi / koma) → list
+    URL http(s) maks 40 baris (duplikat DIPERTAHANKAN — jumlah baris
+    dipakai mode pasangan link↔episode). Semua link portal bisa
+    ditempel sekaligus; pipeline mencoba berurutan sampai berhasil."""
+    parts = re.split(r"[\s,]+", str(raw or "").strip())
+    out = []
+    for p in parts:
+        p = p.strip().strip('"').strip("'")
+        low = p[:8].lower()
+        if low == "https://" or p[:7].lower() == "http://":
+            out.append(p)
+    if len(out) > 40:
+        raise ValueError(f"maksimal 40 link per run (terdeteksi {len(out)})")
+    return out
+
+
+def manual_provider(url):
+    """Deteksi provider satu link manual (untuk log + prioritas)."""
+    low = url.lower()
+    if "mega.nz" in low or "mega.io" in low or "mega.co.nz" in low:
+        return "MEGA"
+    if "drive.google.com" in low or "docs.google.com" in low:
+        return "GDRIVE"
+    if "gofile." in low:
+        return "GOFILE"
+    if "t.me/" in low or "telegram." in low:
+        return "TELEGRAM"
+    return "LANGSUNG"
+
+
+_MANUAL_RANK = {"LANGSUNG": 0, "MEGA": 1, "GDRIVE": 2, "TELEGRAM": 3,
+                "GOFILE": 4}
+
+
+def manual_order(links):
+    """Urutkan kandidat: host langsung (Cast/Vikingfile/dl) dulu, lalu
+    Mega, Drive; Telegram/Gofile terakhir (pasti gagal server-side).
+    sort stabil → urutan tempel user terjaga dalam tiap kelompok."""
+    return sorted(links, key=lambda u: _MANUAL_RANK.get(manual_provider(u), 9))
+
+
+def manual_try_link(url, out_name, log=lambda s: None):
+    """Coba SATU link → (True, nama_asli, None) | (False, None, pesan).
+    File sisa dibersihkan sebelum mencoba supaya part lama tak menipu."""
+    for f in (out_name, out_name + ".part"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    prov = manual_provider(url)
+    log(f"  [{prov}] {url[:95]}")
+    try:
+        if prov == "MEGA":
+            name = mega_download(url, out_name, log=log)
+            return True, name, None
+        if prov == "GDRIVE":
+            direct, size_est = gdrive_resolve(url, log=log)
+            need = max(size_est * 1.15, 200 * 1024 * 1024)
+            if need > shutil.disk_usage(".").free:
+                return False, None, (f"disk kurang (butuh \u2248"
+                                     f"{need/1e9:.1f} GB)")
+            got = {"url": direct, "referer": None,
+                   "size": size_est, "label": "gdrive"}
+            if lk21_download(got, out_name):
+                return True, None, None
+            return False, None, ("GDrive gagal semua strategi (kuota "
+                                "habis / file privat?)")
+        if prov == "TELEGRAM":
+            return False, None, ("link Telegram bukan file langsung — "
+                                 "pakai tombol host file di portal "
+                                 "(Cast / Vikingfile / Mega / Google Share)")
+        if prov == "GOFILE":
+            return False, None, ("Gofile mewajibkan unduhan lewat browser "
+                                 "(token JS) — pakai link Cast / Vikingfile "
+                                 "/ Mega / Google Share dari portal")
+        got = {"url": url, "referer": None, "size": 0, "label": "direct"}
+        if lk21_download(got, out_name):
+            return True, None, None
+        return False, None, "URL langsung gagal (link mati / butuh sesi browser?)"
+    except RuntimeError as e:
+        return False, None, str(e)[:180]
+    except Exception as e:
+        return False, None, repr(e)[:180]
+
+
+def maybe_unzip(out_name, log=lambda s: None):
+    """Task 98 — portal LK21 mengemas file Mega sebagai ZIP ('….mp4.zip',
+    entri STORED). Bila file hasil unduh = ZIP, bongkar dan ambil anggota
+    video terbesar → ganti out_name. Return True bila dibongkar."""
+    try:
+        with open(out_name, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return False
+    if head != b"PK\x03\x04":
+        return False
+    import zipfile
+    log("  hasil unduh = ZIP — membongkar…")
+    try:
+        zf = zipfile.ZipFile(out_name)
+        best, best_sz = None, -1
+        for it in zf.infolist():
+            if it.is_dir() or it.file_size <= best_sz:
+                continue
+            best, best_sz = it, it.file_size
+        if best is None:
+            raise RuntimeError("zip kosong")
+        log(f"  ambil '{(best.filename or '')[:60]}' "
+            f"({best_sz/1e6:.0f} MB)…")
+        tmp = out_name + ".unzip"
+        with zf.open(best) as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"bongkar ZIP gagal: {repr(e)[:120]}")
+    os.replace(tmp, out_name)
+    return True
+
+
+def manual_download_and_upload(links, out_name, log=lambda s: None):
+    """Coba daftar link BERURUTAN sampai satu berhasil → (slug, size).
+    Bila SEMUA link gagal → RuntimeError berisi ringkasan per-link."""
+    errs = []
+    for i, u in enumerate(links):
+        if len(links) > 1:
+            log(f"[link {i + 1}/{len(links)}]")
+        ok, name, err = manual_try_link(u, out_name, log)
+        if not ok:
+            errs.append(f"{manual_provider(u)}: {err}")
+            log(f"  \u2718 {err}")
+            continue
+        try:
+            maybe_unzip(out_name, log)
+        except RuntimeError as ez:
+            try:
+                os.remove(out_name)
+            except OSError:
+                pass
+            errs.append(f"{manual_provider(u)}: {ez}")
+            log(f"  \u2718 {ez}")
+            continue
+        size = os.path.getsize(out_name)
+        if size < 512 * 1024:
+            try:
+                os.remove(out_name)
+            except OSError:
+                pass
+            errs.append(f"{manual_provider(u)}: file hanya {size} byte "
+                        "(bukan video)")
+            log("  \u2718 file hasil bukan video — coba link lain")
+            continue
+        log(f"  unduh OK ({size/1e6:.0f} MB)"
+            + (f" — '{(name or '')[:55]}'" if name else ""))
+        log("  upload ke Abyss\u2026")
+        up = abyss_upload(out_name, log=log)
+        try:
+            os.remove(out_name)
+        except OSError:
+            pass
+        if not (isinstance(up, dict) and up.get("status")):
+            raise RuntimeError(f"upload Abyss ditolak ({up or 'tanpa jawaban'}) "
+                               "— jalankan ulang run ini (link sudah "
+                               "terbukti hidup)")
+        if errs:
+            log(f"  (tercapai setelah {len(errs)} link sebelumnya gagal)")
+        return up["slug"], size
+    raise RuntimeError("SEMUA link gagal:\n  - " + "\n  - ".join(errs[:8])
+                       + ("\n  \u2026" if len(errs) > 8 else ""))
+
+
+def _manual_file_name(judul, is_tv, ep, res):
+    base = (f"{judul} S{SEASON:02d}E{ep:02d} [{res}p]" if is_tv
+            else f"{judul} [{res}p]")
+    return re.sub(r'[<>:"/\\|?*]', "", base).strip() + ".mp4"
+
+
+def manual_bulk_pairs(links, eps, judul, res):
+    """Task 98 — MODE PASANGAN: baris link ke-n \u2194 episode ke-n.
+    Loop per episode dengan budget chunk; sisa ditunda via marker
+    ZS_BULK_REMAIN + ZS_LINK_REMAIN (b64) dan di-antrekan otomatis."""
+    say(f"\nMODE BULK MANUAL: {len(eps)} episode \u00d7 1 link masing-masing "
+        f"— budget chunk {BUDGET_MIN} menit")
+    summary_line(f"- Mode: **BULK manual** — {len(eps)} episode "
+                 f"(baris link ke-n \u2192 episode ke-n)")
+    results, t0 = [], time.time()
+    rem_links = rem_eps = None
+    for i, (u, ep) in enumerate(zip(links, eps)):
+        if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
+            rem_links, rem_eps = links[i:], eps[i:]
+            say(f"\n\u23f8 Budget chunk tercapai ({BUDGET_MIN} mnt) — "
+                f"{len(rem_eps)} episode ditunda ke chunk berikutnya.")
+            break
+        say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
+        FILE = _manual_file_name(judul, True, ep, res)
+        r = {"ep": ep, "ok": False, "error": "", "reg_pending": False}
+        try:
+            slug, size = manual_download_and_upload([u], FILE, say)
+            r.update(ok=True, slug=slug, size=size)
+            reg = register_one(slug, ep, res, size, None, None, True,
+                               retries=3)
+            if reg.get("skip"):
+                r["reg_ok"] = None
+            elif reg.get("ok"):
+                r["reg_ok"] = True
+            elif reg.get("retry"):
+                r["reg_pending"] = True
+            else:
+                r["reg_ok"] = False
+                r["reg_error"] = str(reg.get("error"))[:160]
+        except RuntimeError as e:
+            r["error"] = str(e)[:220]
+        except Exception as e:
+            r["error"] = repr(e)[:220]
+        results.append(r)
+        say(f"  \u2714 E{ep} OK slug {r.get('slug')}" if r.get("ok")
+            else f"  \u2718 E{ep} GAGAL: {r['error'][:130]}")
+
+    # ronde ulang register yang masih "diproses Abyss"
+    for r in [x for x in results if x.get("reg_pending")]:
+        reg = register_one(r["slug"], r["ep"], res, r["size"], None, None,
+                           True, retries=3)
+        r["reg_ok"] = bool(reg.get("ok"))
+        r.pop("reg_pending", None)
+        r["reg_error"] = None if reg.get("ok") else str(reg.get("error"))[:160]
+        say(f"  register ulang E{r['ep']}: "
+            + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+
+    ok_n = sum(1 for r in results if r.get("ok"))
+    reg_n = sum(1 for r in results if r.get("reg_ok"))
+    fail_ep = [r["ep"] for r in results if not r.get("ok")]
+    say("\n" + "=" * 58)
+    say(f"BULK MANUAL: {ok_n} episode terupload, {reg_n} terdaftar, "
+        f"{len(fail_ep)} gagal")
+    for r in results:
+        if r.get("ok"):
+            say(f"  E{r['ep']}: OK slug={r.get('slug')} {res}p"
+                + ("  [register TERTUNDA — ulang via slug_lama]"
+                   if r.get("reg_ok") is False else ""))
+        else:
+            say(f"  E{r['ep']}: GAGAL — {r['error'][:110]}")
+    if fail_ep:
+        spec_f = build_episode_spec(fail_ep)
+        say(f"Episode gagal: {spec_f} — tempel link BARU utk episode itu "
+            "lalu jalankan lagi (token series masih hidup 72 jam).")
+        summary_line(f"- Gagal (link baru + episodes `{spec_f}`): `{spec_f}`")
+    if rem_eps:
+        spec = build_episode_spec(rem_eps)
+        blob = base64.b64encode(json.dumps(rem_links).encode()).decode()
+        say(f"\nSISA {len(rem_eps)} episode \u2192 chunk berikutnya otomatis.")
+        say(f"ZS_BULK_REMAIN:{spec}")
+        say(f"ZS_LINK_REMAIN:{blob}")
+        summary_line(f"- Chunk berikutnya (otomatis): episodes `{spec}`")
+    say("=" * 58)
+    if results and ok_n == 0 and not rem_eps:
+        sys.exit(1)
+
+
 def main_manual():
-    """Alur sumber MANUAL (Task 97): link file final dari portal LK21
-    (GDrive 'Google Share' / Mega / URL mp4 langsung) → unduh → Abyss →
-    register. Satu link per run; bulk tidak didukung."""
+    """Alur sumber MANUAL (Task 97, dirombak Task 98): tempel link file
+    final dari portal LK21 — BOLEH BANYAK SEKALIGUS (satu per baris).
+    - Film / 1 episode: semua link = kandidat, dicoba berurutan sampai
+      ada yang berhasil (host gagal otomatis dilewati).
+    - Series banyak episode: jumlah baris link HARUS = jumlah episode;
+      baris ke-n dipasangkan ke episode ke-n (di-chunk otomatis)."""
     egress = mb_ip()
-    say(f"ZS pipeline — SUMBER MANUAL (link langsung)\nIP egress: {egress}\n")
+    say(f"ZS pipeline — SUMBER MANUAL multi-link\nIP egress: {egress}\n")
     summary_line(f"# ZS Download (Manual) — {TITLE}")
     if not LINK:
         fail("Input 'link' kosong — tempel link file (Google Share / "
-             "Mega / URL mp4) dari halaman download LK21.")
-    if EPISODES_SPEC:
-        fail("Sumber manual = SATU link per run (bulk hanya untuk "
-             "moviebox). Antre ulang untuk tiap episode.")
+             "Mega / URL mp4; boleh beberapa baris sekaligus).")
+    try:
+        links = manual_parse_links(LINK)
+    except ValueError as e:
+        fail(str(e))
     is_tv = TIPE == "tv"
-    ep = EPISODE
+    eps = []
+    if EPISODES_SPEC:
+        try:
+            eps = parse_episode_spec(EPISODES_SPEC)
+        except ValueError as e:
+            fail(f"input 'episodes' tidak valid: {e}")
     judul = (TITLE or "Film").strip()
     m_res = re.search(r"(\d{3,4})", QUALITY or "")
     res = int(m_res.group(1)) if m_res else 1080
-    if is_tv:
-        FILE = f"{judul} S{SEASON:02d}E{ep:02d} [{res}p].mp4"
-    else:
-        FILE = f"{judul} [{res}p].mp4"
-    FILE = re.sub(r'[<>:"/\\|?*]', "", FILE).strip()
     say(f"Judul: {judul} | tipe: {'SERIES' if is_tv else 'Film'} | "
-        f"ep: {ep} | target: [{res}p]")
-    say(f"Link: {LINK[:100]}")
-    cleanup_workspace(keep=FILE)
-    low = LINK.lower()
+        f"link ditempel: {len(links)}")
+    if eps:
+        say(f"Episode diminta: {build_episode_spec(eps)} ({len(eps)})")
+    cleanup_workspace()
+
+    # ---- mode pasangan: series banyak episode ----
+    if is_tv and len(eps) > 1:
+        if len(links) != len(eps):
+            fail(f"Jumlah baris link ({len(links)}) TIDAK SAMA dengan "
+                 f"jumlah episode ({len(eps)}). Aturan: baris link ke-n "
+                 "\u2192 episode ke-n. Pilihan: (1) tempel link sesuai "
+                 "jumlah episode, atau (2) pilih 1 episode saja — semua "
+                 "link jadi kandidat cadangan.")
+        return manual_bulk_pairs(links, eps, judul, res)
+
+    # ---- mode tunggal: film / satu episode; semua link = kandidat ----
+    ep = eps[0] if eps else EPISODE
+    FILE = _manual_file_name(judul, is_tv, ep, res)
+    say(f"File target: {FILE}")
+    if len(links) > 1:
+        ordered = manual_order(links)
+        say("Urutan coba: "
+            + " \u2192 ".join(manual_provider(u) for u in ordered))
+    else:
+        ordered = links
     try:
-        if "mega.nz" in low or "mega.io" in low or "mega.co.nz" in low:
-            say("  provider: MEGA (dekripsi AES-CTR native)…")
-            got_name = mega_download(LINK, FILE, log=say)
-            if got_name:
-                say(f"  nama file asli: {got_name[:70]}")
-        elif "drive.google.com" in low or "docs.google.com" in low:
-            say("  provider: GOOGLE DRIVE…")
-            direct, size_est = gdrive_resolve(LINK, log=say)
-            say(f"  URL unduh siap ({size_est/1e6:.0f} MB "
-                f"{'perkiraan' if size_est else 'tidak diketahui'})")
-            need = max(size_est * 1.15, 200 * 1024 * 1024)
-            if need > shutil.disk_usage(".").free:
-                fail(f"disk kurang (butuh ≈{need/1e9:.1f} GB)")
-            got = {"url": direct, "referer": None,
-                   "size": size_est, "label": "gdrive"}
-            if not lk21_download(got, FILE):
-                fail("unduh GDrive gagal semua strategi — cek link di "
-                     "browser (mungkin kuota habis / file privat)")
-        elif low.startswith("http://") or low.startswith("https://"):
-            say("  provider: URL LANGSUNG…")
-            got = {"url": LINK, "referer": None, "size": 0,
-                   "label": "direct"}
-            if not lk21_download(got, FILE):
-                fail("unduh URL langsung gagal — cek link masih hidup")
-        else:
-            fail("link tidak dikenali: pakai link Google Drive, Mega, "
-                 "atau URL http(s) langsung ke file mp4")
+        slug, size = manual_download_and_upload(ordered, FILE, say)
     except RuntimeError as e:
         fail(str(e))
-    size = os.path.getsize(FILE)
-    if size < 1024 * 512:
-        try:
-            os.remove(FILE)
-        except OSError:
-            pass
-        fail(f"file hasil unduh hanya {size} byte — kemungkinan halaman "
-             "error, bukan video. Cek link di browser dulu.")
-    say(f"  unduh OK ({size/1e6:.0f} MB) — upload ke Abyss…")
-    up = abyss_upload(FILE, log=say)
-    if not (isinstance(up, dict) and up.get("status")):
-        try:
-            os.remove(FILE)
-        except OSError:
-            pass
-        fail(f"upload Abyss ditolak ({up or 'tanpa jawaban'})")
-    slug = up["slug"]
-    try:
-        os.remove(FILE)
-    except OSError:
-        pass
     say(f"  upload OK: slug {slug} — file lokal dihapus")
     reg = register_one(slug, ep if is_tv else 1, res, size, None, None,
                        is_tv, retries=3)
     say("\n" + "=" * 58)
-    # cek skip DULU — register_one kembali ok=True+skip utk token kosong
     if reg.get("skip"):
         say(f"SELESAI (upload OK, [{res}p]). Slug: {slug} — register "
             "dilewati: token kosong. Isi token di panel lalu pakai "

@@ -23,7 +23,7 @@ on:
           - lk21
           - manual
       link:
-        description: "[manual] Link file final: Google Share/Mega/URL mp4 — dari halaman download LK21 (dadadidi.de)"
+        description: "[manual] Link file final — BOLEH BANYAK (pisah newline/spasi/koma): Cast/Vikingfile/Mega/Google Share dari portal LK21. Film/1 episode = dicoba berurutan sampai ada yang berhasil; series = jumlah baris harus = jumlah episode (baris n → episode n)"
         required: false
         default: ""
       tipe:
@@ -311,9 +311,16 @@ jobs:
           m = re.search(r"ZS_BULK_REMAIN:([0-9,\-]+)", full_log)
           if m:
               remain = m.group(1)
+          # Task 98 — sisa LINK pasangan manual (b64 JSON list)
+          linkremain = ""
+          m2 = re.search(r"ZS_LINK_REMAIN:([A-Za-z0-9+/=]+)", full_log)
+          if m2:
+              linkremain = m2.group(1)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"remain={remain}\n")
-          print(f"== sisa episode chunk berikutnya: {remain or '(tidak ada)'} ==")
+              f.write(f"linkremain={linkremain}\n")
+          print(f"== sisa episode chunk berikutnya: {remain or '(tidak ada)'} =="
+                + (f" (+{len(linkremain)} b64 link)" if linkremain else ""))
 
           if exit_code != 0:
               raise SystemExit(f"pipeline gagal di codespace (exit {exit_code})")
@@ -326,8 +333,10 @@ jobs:
         if: steps.monitor.outputs.remain != ''
         env:
           REMAIN: ${{ steps.monitor.outputs.remain }}
+          LINK_REMAIN: ${{ steps.monitor.outputs.linkremain }}
           I_JUDUL: ${{ inputs.judul }}
           I_SUMBER: ${{ inputs.sumber }}
+          I_TIPE: ${{ inputs.tipe }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
           I_BUDGET: ${{ inputs.budget_menit }}
@@ -336,12 +345,22 @@ jobs:
           I_TOKEN: ${{ inputs.token }}
         run: |
           python3 - <<'PY'
-          import json, os, urllib.request, urllib.error
+          import base64, json, os, urllib.request, urllib.error
 
           REPO = "fauziramadha/mb-relay"
+          # Task 98: chunk manual multi-link bawa sisa LINK pasangannya
+          links_sisa = ""
+          if os.environ.get("LINK_REMAIN"):
+              try:
+                  links_sisa = "\n".join(json.loads(
+                      base64.b64decode(os.environ["LINK_REMAIN"])))
+              except Exception:
+                  links_sisa = ""
           inputs = {
               "judul": os.environ["I_JUDUL"],
               "sumber": os.environ["I_SUMBER"] or "moviebox",
+              "link": links_sisa,
+              "tipe": (os.environ["I_TIPE"] or "") if links_sisa else "",
               "pilihan": os.environ["I_PICK"] or "0",
               "musim": os.environ["I_MUSIM"] or "1",
               "episode": "1",

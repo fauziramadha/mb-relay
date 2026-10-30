@@ -358,10 +358,12 @@ error 600010 berulang meski diklik natural). Kesimpulan: portal TIDAK bisa
 diotomatisasi server-side — tapi file DI HOST tujuan (Drive/Mega) tidak
 digerbang.
 
-**Cara pakai (user):** buka halaman download LK21 di browser → klik tombol
-DOWNLOAD 1080p (Google Share / Mega) → salin link final → Admin → Unduh
-Otomatis → sumber **Link Manual** → tempel link + judul + episode → sisanya
-otomatis (unduh → Abyss → register). Satu link per run.
+**Cara pakai (user, Task 98):** buka halaman download LK21 → kumpulkan SEMUA
+link (Cast / Vikingfile / Mega / Google Share) → Admin → Unduh Otomatis →
+sumber **Link Manual** → tempel SEMUA link SEKALIGUS (satu per baris) + judul
+→ sisanya otomatis. Link mati/kena-kuota DILEWATI otomatis — pipeline lanjut
+ke baris berikutnya sampai ada yang berhasil. Series: jumlah baris link harus
+= jumlah episode (baris ke-n → episode ke-n; di-chunk otomatis ±95 mnt).
 
 **Dukungan teknis (`main_manual` zs_dl.py):**
 - **Google Drive**: semua bentuk link (`/file/d/`, `uc?id=`, `open?id=`) →
@@ -369,13 +371,20 @@ otomatis (unduh → Abyss → register). Satu link per run.
   `drive.usercontent.google.com/download` → form hidden inputs
   (id/export/confirm/uuid) → GET, fallback POST bila ditolak. Deteksi
   jelas utk kuota habis & file privat.
-- **Mega** (`mega.nz/file/<id>#<key>` & bentuk klasik `#!…!…`): API
-  `g.api.mega.co.nz` a=`g` → kunci AES di-unwrap AES-ECB dari fragmen URL
-  (32B) → atribut nama file didekrip ECB (blob `MEGA{"n":…}`) → unduh
-  stream 1 MB + dekrip AES-CTR (nonce 8B + counter 8B nol). Error kuota
-  IP (-4/-19) dipetakan pesan jelas. Divalidasi OFFLINE byte-per-byte
-  (skrip task97-mega-crypto.py).
+- **Mega** (`mega.nz/file/<id>#<key>` & bentuk klasik `#!…!…`) — FIX Task 98
+  (tervalidasi LIVE dgn file portal 819 MB): API `POST /cs?id=1&n={fid}`
+  payload `{"a":"g","g":1,"p":fid,"ssl":2}` TANPA `v:2` (v:2 = mode msd
+  multi-segmen 6 URL — jangan); kunci file = XOR dua half fragmen URL,
+  nonce CTR = byte 16-24 fragmen; atribut nama = AES-128-CBC IV-nol (blob
+  `MEGA{"n":…}`); data = AES-CTR stream. File portal berbentuk `.mp4.zip`
+  → dibongkar otomatis (`maybe_unzip`, entri STORED) sebelum upload.
 - **URL mp4 langsung**: kaskade urllib/curl-h2/wget (sama jalur LK21).
-- Input workflow baru: `link`, `tipe` (movie/tv); bulk tidak berlaku.
-- Panel Admin: tombol sumber "Link Manual" + kolom link + episode tunggal
-  (handlers.ts bulk-dispatch sumber=manual; admin/page.tsx Task 97).
+- Input workflow: `link` (BOLEH multi-baris, maks 40), `tipe` (movie/tv),
+  `episodes` (mode pasangan N link ↔ N episode; chunk lanjutan membawa
+  sisa link via marker `ZS_LINK_REMAIN` b64).
+- Prioritas coba: host langsung (Cast/Vikingfile/mp4) → Mega → Google
+  Drive; Telegram & Gofile ditolak dgn pesan jelas (Gofile mewajibkan
+  token JS browser; t.me bukan file langsung).
+- Panel Admin: textarea multi-link + grid episode (mode pasangan) +
+  validasi jumlah baris ↔ episode (handlers.ts + admin/page.tsx Task 98).
+- Uji: `scripts/test-manual-multilink.py` (20 cek termasuk Mega LIVE).
