@@ -216,11 +216,12 @@ pipeline ini memang on-demand (jalan hanya saat kamu meminta film).
 
 ---
 
-## Dua sumber unduhan: MovieBox & LK21 (v2 — Task 96b, 29 Okt 2026)
+## Tiga sumber unduhan: MovieBox & LK21 (v2) & Link Manual (Task 97)
 
-Workflow `ZS Download` punya pilihan **`sumber`**: `moviebox` (utama) dan
+Workflow `ZS Download` punya pilihan **`sumber`**: `moviebox` (utama),
 `lk21` (katalog Indonesia — hardsub/softsub, judul yang sering tidak ada
-di MovieBox, termasuk film China/Asia terbaru).
+di MovieBox, termasuk film China/Asia terbaru), dan **`manual`** (Task 97
+— link file final dari portal unduh LK21: Google Share/Mega/URL mp4).
 
 **Mengapa LK21 pernah gagal total (run 28-29 Okt):** semua tombol unduhan
 LK21 dibungkus shortlink **ouo.io** yang dilindungi Cloudflare Turnstile —
@@ -343,3 +344,38 @@ rute Render juga ditinggalkan — wajib kartu + IP-nya diblokir CDN.)
   terupload tapi belum masuk katalog (lupa token) tinggal register
   ulang tanpa unduh 2,4 GB lagi; register juga kini retry saat Abyss
   masih mem-proses (jawaban 202).
+
+---
+
+## Sumber MANUAL — link file final dari portal LK21 (Task 97, 30 Okt 2026)
+
+**Latar (terverifikasi 30 Okt):** portal unduh resmi LK21 (`dadadidi.de/get/…`,
+identitas INDEXMOVIE.BIZ) menyimpan file **1080p** (Google Share / Mega /
+Cast / Telegram). Halaman berada di balik dua gerbang Cloudflare: challenge
+halaman (BISA lewat otomatis via headless) + **Turnstile embed** sitekey
+`0x4AAAAAAD1B9GOEfUpOVP4w` pada `verifying.php` (headless TERUJI GAGAL:
+error 600010 berulang meski diklik natural). Kesimpulan: portal TIDAK bisa
+diotomatisasi server-side — tapi file DI HOST tujuan (Drive/Mega) tidak
+digerbang.
+
+**Cara pakai (user):** buka halaman download LK21 di browser → klik tombol
+DOWNLOAD 1080p (Google Share / Mega) → salin link final → Admin → Unduh
+Otomatis → sumber **Link Manual** → tempel link + judul + episode → sisanya
+otomatis (unduh → Abyss → register). Satu link per run.
+
+**Dukungan teknis (`main_manual` zs_dl.py):**
+- **Google Drive**: semua bentuk link (`/file/d/`, `uc?id=`, `open?id=`) →
+  tarian confirm modern: `uc?export=download` → redirect
+  `drive.usercontent.google.com/download` → form hidden inputs
+  (id/export/confirm/uuid) → GET, fallback POST bila ditolak. Deteksi
+  jelas utk kuota habis & file privat.
+- **Mega** (`mega.nz/file/<id>#<key>` & bentuk klasik `#!…!…`): API
+  `g.api.mega.co.nz` a=`g` → kunci AES di-unwrap AES-ECB dari fragmen URL
+  (32B) → atribut nama file didekrip ECB (blob `MEGA{"n":…}`) → unduh
+  stream 1 MB + dekrip AES-CTR (nonce 8B + counter 8B nol). Error kuota
+  IP (-4/-19) dipetakan pesan jelas. Divalidasi OFFLINE byte-per-byte
+  (skrip task97-mega-crypto.py).
+- **URL mp4 langsung**: kaskade urllib/curl-h2/wget (sama jalur LK21).
+- Input workflow baru: `link`, `tipe` (movie/tv); bulk tidak berlaku.
+- Panel Admin: tombol sumber "Link Manual" + kolom link + episode tunggal
+  (handlers.ts bulk-dispatch sumber=manual; admin/page.tsx Task 97).
