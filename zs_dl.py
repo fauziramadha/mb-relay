@@ -901,6 +901,11 @@ def run_bulk(domain, dp, sel, is_tv, eps):
 def lk21_download(got, out_name):
     """Kaskade strategi unduh zs_dl utk URL LK21 (referer khusus per host).
     Return True bila file lengkap (target size bila diketahui)."""
+    # [Task 97] global WAJIB: tanpa ini assignment "MB_STRAT_OK = …" di
+    # bawah menjadikannya variabel LOKAL → pembacaan awal (order=…) kena
+    # UnboundLocalError (run manual #41005479615 — jalur ini tak pernah
+    # tersentuh pipeline Byse/HLS sebelumnya, makanya laten).
+    global MB_STRAT_OK
     ref = got.get("referer") or "https://tv.nontonfilm.red/"
     target = int(got.get("size") or 0)
     base = {"User-Agent": UA, "Referer": ref,
