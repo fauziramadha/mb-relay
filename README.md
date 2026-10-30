@@ -89,6 +89,25 @@ ke repo = Codespace otomatis memakainya saat dibangunkan berikutnya.
 
 ---
 
+## Upload Abyss v2 (Task 96c — rotasi endpoint)
+
+Ingress `up.abyss.to` pernah dicekik <2 KB/dtk (Warkop 3,13 GB gagal 2 run,
+30 Okt) sementara ingress kembar **`up.hydrax.net` terukur 6x lebih cepat**
+(796 vs 136 KB/dtk) dengan kunci sama. `zs_dl.py` kini memakai
+`abyss_upload()`:
+
+1. **Rotasi endpoint**: `http://up.hydrax.net` → `https://up.hydrax.net` →
+   `https://up.abyss.to` (jatah waktu 80/30/15 mnt, rute mati dilewati).
+2. **Guard stall sabar**: putus hanya bila <2 KB/dtk **selama 5 menit**
+   (dulu 2 menit — fase lambat Abyss 80-300 KB/dtk itu normal, bukan mati).
+3. **Pemulihan katalog**: bila SEMUA byte terkirim tapi jawaban tak datang
+   (server lambat memproses — kasus nyata file 64 MB "timeout" ternyata
+   tersimpan), pipeline mencari slug baru di `api.hydrax.net/{KEY}/list`.
+
+Monitor workflow dinaikkan 2 → 2,5 jam; `timeout-minutes` 150 → 200.
+
+---
+
 ## CARA PAKAI (rutin — cuma 1 klik)
 
 1. Buka tab **Actions** repo ini → workflow **ZS Download (MovieBox ke Abyss)**
@@ -233,6 +252,32 @@ Paket `cryptography` di-bootstrap otomatis via pip (`--target /tmp`).
 (varian tertinggi yang mereka ekspos); kualitas `auto/1080/720/360` diabaikan
 untuk Byse. Bila suatu judul tidak punya iframe Byse (jarang), pipeline
 jatuh ke host tanpa-ouo / embed GDrive seperti sebelumnya.
+
+## Pencarian pintar + fallback otomatis (Task 96d — 30 Okt 2026)
+
+Run "Agent Kim Reactivated" user gagal karena TIGA jebakan yang kini
+sudah ditambal:
+
+1. **Skema URL baru LK21** — series kini hidup di `/tv/<judul>/` dan
+   episode di `/eps/<judul>-episode-N/`. Regex lama hanya membaca slug
+   satu segmen (film) → SEMUA judul series tak terlihat oleh pencarian.
+2. **Sampah pencarian** — saat judul tak ada, tema LK21 menampilkan
+   daftar unggahan terbaru; pick `[0]` lama sempat memilih judul
+   dewasa. Sekarang: setiap hasil di**skor relevansi token** terhadap
+   query asli (ambang 0.6), hasil tak relevan disembunyikan, judul
+   dewasa difilter, dan pick `[0]` = hasil paling relevan (mode bulk
+   mengutamakan `/tv/` + post-episode, mode film mengutamakan film).
+3. **Query panjang kadang gagal di WP-search** — kini dicoba ulang
+   otomatis dgn potongan kata depan ("Agent Kim Reactivated" →
+   "Agent Kim"), semua tetap diskor terhadap query asli.
+
+Plus **fallback otomatis dua arah**: LK21 tak punya judulnya → lanjut
+sendiri ke MovieBox; MovieBox tak punya → lanjut ke LK21 (mis. drama
+"Agent Kim Reactivated" hanya ada di LK21, film "Warkop DKI: Viralize
+Noooow" hanya ada di MovieBox — admin tidak perlu menebak sumber).
+Subtitle & upload & register tidak berubah. Contoh verifikasi sandbox:
+resolve Byse E1 drama tsb = 720p 574 MB + subtitle Indonesia 59.602
+karakter.
 
 ---
 

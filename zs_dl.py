@@ -968,14 +968,24 @@ def lk21_hls_download(got, out_name):
     return True
 
 
-def lk21_process_one(dom, sel, ep, is_tv):
+def lk21_process_one(dom, sel, ep, is_tv, base_det=None):
     """LK21 satu target: resolve → unduh → sub SRT → upload → register.
+    base_det = hasil lk_detail halaman series (96d: berisi link episode
+    path penuh eps/… — dipakai supaya URL episode tidak salah bangun).
     Return dict hasil (tidak sys.exit — pemanggil melanjutkan)."""
     judul, tahun = sel.get("title") or "film", sel.get("year") or ""
-    slug_page = re.sub(r"-episode-\d+$", "", sel["slug"])
     try:
         if is_tv:
-            det = lk21.lk_detail(f"{slug_page}-episode-{ep}", dom)
+            target = None
+            for e in ((base_det or {}).get("episode_links") or []):
+                m_ep = re.search(r"episode-(\d+)$", e)
+                if m_ep and int(m_ep.group(1)) == ep:
+                    target = e
+                    break
+            if target is None:
+                slug_page = re.sub(r"-episode-\d+$", "", sel["slug"])
+                target = f"{slug_page}-episode-{ep}"
+            det = lk21.lk_detail(target, dom)
         else:
             det = lk21.lk_detail(sel["slug"], dom)
     except Exception as e:
@@ -1097,7 +1107,7 @@ def lk21_process_one(dom, sel, ep, is_tv):
     return r
 
 
-def run_bulk_lk21(dom, sel, eps):
+def run_bulk_lk21(dom, sel, eps, base_det=None):
     """Bulk LK21 (series): pola sama dgn run_bulk MovieBox — satu episode
     per iterasi + budget chunk + marker ZS_BULK_REMAIN utk chunk lanjutan."""
     judul = sel.get("title") or "series"
@@ -1115,7 +1125,7 @@ def run_bulk_lk21(dom, sel, eps):
             break
         say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
         try:
-            r = lk21_process_one(dom, sel, ep, True)
+            r = lk21_process_one(dom, sel, ep, True, base_det)
         except Exception as e:
             r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
         results.append(r)
@@ -1159,8 +1169,12 @@ def run_bulk_lk21(dom, sel, eps):
         sys.exit(1)
 
 
-def main_lk21():
-    """Alur sumber LK21: cari → pilih → (film | series tunggal/bulk)."""
+def main_lk21(from_mb_fallback=False):
+    """Alur sumber LK21 (Task 96d): cari PINTAR (multi-query + skor
+    relevansi — LK21 menampilkan daftar unggahan terbaru saat judul tak
+    ada, dan judul series hidup di skema /tv/ + /eps/ yang dulu tak
+    terbaca) → pilih → (film | series tunggal/bulk). Tidak ada hasil
+    relevan → fallback OTOMATIS ke MovieBox."""
     if REUSE_SLUG:
         fail("slug_lama (register-saja) hanya untuk sumber moviebox — "
              "LK21 tidak punya koneksi slug lama.")
@@ -1169,42 +1183,112 @@ def main_lk21():
     summary_line(f"# ZS Download (LK21) — {TITLE}")
     summary_line(f"- IP runner: `{egress}` | sumber: LK21")
     dom = lk21.lk_domain()
-    results = lk21.lk_search(TITLE, dom)
-    if not results:
-        fail(f"Tidak ada hasil '{TITLE}' di LK21 — coba kata kunci lain "
-             "atau jalankan dengan sumber moviebox.")
-    say(f"Hasil pencarian LK21 '{TITLE}': {len(results)} judul")
+    results, used_q = lk21.lk_find(TITLE, dom, log=lambda *a: say(" ", *a))
+    relevant = [it for it in results if it.get("score", 0) >= 0.6]
+    say(f"Hasil pencarian LK21 '{TITLE}' "
+        f"(query efektif: '{used_q}'): {len(results)} judul — "
+        f"{len(relevant)} relevan"
+        + (f", {len(results) - len(relevant)} di bawah ambang (sembunyikan "
+            "dari pilihan)" if results else ""))
     listing = ["\n## Hasil pencarian LK21\n"]
-    for i, it in enumerate(results[:20]):
-        line = f"[{i:>2}] {it.get('title', '?')} ({it.get('year', '-')})"
+    for i, it in enumerate(relevant[:20]):
+        jenis = ("SERIES" if it.get("kind") == "tv"
+                  else f"EP{it.get('ep') or '?'}" if it.get("kind") == "episode"
+                  else "Film")
+        line = (f"[{i:>2}] {jenis:<7} {it.get('title', '?')} "
+                f"({it.get('year', '-')}) — skor {it.get('score', 0)}")
         say("  " + line)
         listing.append(f"- `{i}` **{it.get('title', '?')}** "
-                       f"({it.get('year', '-')})")
+                       f"({it.get('year', '-')}) — skor {it.get('score')}")
+    if len(results) > len(relevant):
+        say(f"  (+{len(results) - len(relevant)} hasil tak relevan "
+            "tidak ditawarkan)")
+        listing.append(f"- _{len(results) - len(relevant)} hasil tak relevan "
+                       "disembunyikan (skor < 0.6)_")
     summary_line("\n".join(listing))
-    if PICK < 0 or PICK >= len(results):
-        fail(f"Pilihan indeks {PICK} di luar daftar LK21 "
-             f"(0..{len(results)-1}) — lihat daftar di atas.")
-    sel = results[PICK]
-    say(f"\nTerpilih: {sel['title']} ({sel['year']})")
 
-    # deteksi series dari link episode di halaman detail
-    base_det = lk21.lk_detail(sel["slug"], dom)
-    is_tv = bool(base_det["episode_links"])
-    say("Tipe:", "SERIES" if is_tv else "Film")
+    if not relevant:
+        if from_mb_fallback:
+            fail(f"Judul '{TITLE}' TIDAK ditemukan di LK21 maupun MovieBox."
+                 "\nCoba kata kunci lain — judul Inggris resmi (TMDB) "
+                 "biasanya paling akurat.")
+        say("\n🔁 LK21 tidak punya judul ini — lanjut OTOMATIS dengan "
+            "sumber MOVIEBOX…")
+        summary_line("- LK21: 0 hasil relevan → **fallback MovieBox**")
+        return run_moviebox(from_lk_fallback=True)
+    if PICK < 0 or PICK >= len(relevant):
+        fail(f"Pilihan indeks {PICK} di luar daftar LK21 "
+             f"(0..{len(relevant)-1}) — lihat daftar di atas.")
+    if PICK == 0:
+        # pilihan otomatis: mode bulk (series) → utamakan /tv/ + episode;
+        # mode film → utamakan film.
+        want_series = bool(EPISODES_SPEC)
+        prio = ("tv episode" if want_series else " tv episode").split()
+        prio = {k: n for n, k in enumerate(prio)}
+        prio.setdefault("", 2 if want_series else 0)
+        sel_i = min(
+            range(len(relevant)),
+            key=lambda i: (-relevant[i].get("score", 0),
+                           prio.get(relevant[i].get("kind") or "", 3),
+                           relevant[i].get("ep") or 99))
+        if sel_i != 0:
+            say(f"   pilihan otomatis [0] → indeks {sel_i} "
+                f"({relevant[sel_i]['title']} — paling relevan utk mode "
+                f"{'series' if want_series else 'film'})")
+        PICK_EFF = sel_i
+    else:
+        PICK_EFF = PICK
+    sel = relevant[PICK_EFF]
+    say(f"\nTerpilih: {sel['title']} ({sel['year']}) — "
+        f"skor {sel.get('score')}")
+
+    # halaman dasar: kalau terpilih post-episode (eps/…), naikkan ke
+    # halaman series /tv/ utk daftar episode lengkap; kalau /tv/ tidak
+    # ada, pakai halaman eps itu sendiri (biasanya juga memuat link
+    # episode lain).
+    base_slug = sel["slug"]
+    base_det = None
+    if sel.get("kind") == "episode":
+        cand = re.sub(r"^eps/", "tv/",
+                      re.sub(r"-episode-\d+$", "", base_slug))
+        try:
+            cand_det = lk21.lk_detail(cand, dom)
+            if cand_det.get("episode_links"):
+                base_slug, base_det = cand, cand_det
+                say(f"   halaman series: {cand} "
+                    f"({len(cand_det['episode_links'])} episode)")
+        except Exception:
+            pass
+    if base_det is None:
+        try:
+            base_det = lk21.lk_detail(base_slug, dom)
+        except Exception as e:
+            fail(f"Halaman detail LK21 gagal dibuka: {repr(e)[:120]}")
+    is_tv = bool(base_det.get("episode_links")) or \
+        sel.get("kind") in ("tv", "episode")
+    eps_n = len(base_det.get("episode_links") or [])
+    say("Tipe:", "SERIES" if is_tv else "Film",
+        f"({eps_n} episode di LK21)" if is_tv else "")
 
     if EPISODES_SPEC:
         if not is_tv:
-            fail("Input 'episodes' (bulk) hanya untuk SERIES — pilih "
-                 "hasil bertipe series (punya halaman episode di LK21).")
+            fail("Hasil terpilih bertipe FILM — input 'episodes' (bulk) "
+                 "hanya untuk SERIES. Jalankan ulang TANPA episodes utk "
+                 "film, atau pilih indeks hasil bertipe SERIES/EP di atas.")
         try:
             eps = parse_episode_spec(EPISODES_SPEC)
         except ValueError as e:
             fail(f"Input 'episodes' tidak valid: {e}")
-        run_bulk_lk21(dom, sel, eps)
+        run_bulk_lk21(dom, sel, eps, base_det)
         return
 
     ep = EPISODE if is_tv else 1
-    r = lk21_process_one(dom, sel, ep, is_tv)
+    eps_avail = sorted(int(m.group(1)) for e in base_det["episode_links"]
+                       for m in [re.search(r"episode-(\d+)$", e)] if m)
+    if is_tv and eps_avail and ep not in eps_avail:
+        fail(f"Episode {ep} tidak ada di LK21 "
+             f"(tersedia: {eps_avail[:12]}{'…' if len(eps_avail) > 12 else ''}).")
+    r = lk21_process_one(dom, sel, ep, is_tv, base_det)
     if not r.get("ok"):
         fail(f"Gagal: {r.get('error')} — LK21 punya batasan host; "
              "coba sumber moviebox untuk judul ini.")
@@ -1222,16 +1306,23 @@ def main_lk21():
     say("=" * 58)
 
 
-def main():
-    if not TITLE:
-        fail("Input 'judul' kosong — isi kata kunci pencarian.")
-    if not ABYSS_KEY:
-        fail("Secret ABYSS_KEY belum diset di repo.")
-    if EPISODES_SPEC and REUSE_SLUG:
-        fail("Input 'episodes' (bulk) tidak bisa dipakai bersama 'slug_lama' ")
-    if SOURCE == "lk21":
-        return main_lk21()
+def mb_rank(results, query):
+    """Task 96d: skor relevansi hasil MovieBox vs query — pick [0] tidak
+    boleh asal (mis. 'Agent Kim Reactivated' pernah cocok ke 'The Legend
+    of Kitchen Soldier'). Kembalikan (ranked, relevant)."""
+    for it in results:
+        probe = {"title": str(it.get("title") or ""),
+                 "slug": str(it.get("detailPath") or ""),
+                 "year": (str(it.get("releaseDate") or ""))[:4]}
+        it["score"] = round(lk21._score(query, probe), 2)
+    ranked = sorted(results, key=lambda x: -x["score"])
+    return ranked, [x for x in ranked if x.get("score", 0) >= 0.6]
 
+
+def run_moviebox(from_lk_fallback=False):
+    """Alur sumber MovieBox (dipanggil langsung ATAU sbg fallback LK21).
+    Task 96d: hasil diskor relevansi; pick [0] = ter-relevan; 0 hasil
+    relevan → fallback OTOMATIS ke LK21."""
     egress = mb_ip()
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")
     summary_line(f"# ZS Download — {TITLE}")
@@ -1240,24 +1331,52 @@ def main():
     # 1. cari judul
     results = mb_search(TITLE)
     if not results:
-        fail(f"Tidak ada hasil untuk '{TITLE}' — coba kata kunci lain "
-             "(judul Inggris biasanya lebih akurat).")
-    say(f"Hasil pencarian '{TITLE}': {len(results)} judul")
+        if from_lk_fallback:
+            fail(f"Judul '{TITLE}' tidak ditemukan di LK21 maupun "
+                 "MovieBox — coba kata kunci lain.")
+        say("MovieBox: 0 hasil — lanjut OTOMATIS dengan sumber LK21…")
+        summary_line("- MovieBox: 0 hasil → **fallback LK21**")
+        return main_lk21(from_mb_fallback=True)
+    results, relevant = mb_rank(results, TITLE)
+    say(f"Hasil pencarian MovieBox '{TITLE}': {len(results)} judul — "
+        f"{len(relevant)} relevan")
     listing = ["\n## Hasil pencarian\n"]
     for i, it in enumerate(results[:20]):
         year = (it.get("releaseDate") or "")[:4]
         jenis = "SERIAL" if it.get("subjectType") == 2 else "Film"
         flag = "" if it.get("hasResource") is not False else " [belum ada video]"
-        line = f"[{i:>2}] {jenis:<6} {it.get('title', '?')} ({year}){flag}"
+        line = (f"[{i:>2}] {it.get('score', 0):.2f} {jenis:<6} "
+                f"{it.get('title', '?')} ({year}){flag}")
         say("  " + line)
-        listing.append(f"- `{i}` {jenis} **{it.get('title', '?')}** ({year}){flag}")
+        listing.append(f"- `{i}` {jenis} **{it.get('title', '?')}** "
+                       f"({year}) — skor {it.get('score', 0)}{flag}")
     summary_line("\n".join(listing))
+
+    if not relevant:
+        if from_lk_fallback:
+            fail(f"Judul '{TITLE}' tidak ditemukan relevan di LK21 maupun "
+                 "MovieBox. Hasil pencarian hanya judul lain yang mirip — "
+                 "cek ejaan / pakai judul Inggris resmi.")
+        say("\n🔁 MovieBox tidak punya judul ini (0 hasil relevan) — "
+            "lanjut OTOMATIS dengan sumber LK21…")
+        summary_line("- MovieBox: 0 hasil relevan → **fallback LK21**")
+        return main_lk21(from_mb_fallback=True)
 
     if PICK < 0 or PICK >= len(results):
         fail(f"Pilihan indeks {PICK} di luar daftar (0..{len(results)-1}). "
              "Lihat daftar di atas, jalankan ulang workflow dengan 'pilihan' "
              "yang benar.")
-    sel = results[PICK]
+    if PICK == 0:
+        idx = results.index(relevant[0])
+        if idx != 0:
+            say(f"   pilihan otomatis [0] → indeks {idx} "
+                f"({relevant[0].get('title')} — paling relevan)")
+        sel = relevant[0]
+    else:
+        sel = results[PICK]
+        if sel.get("score", 0) < 0.6:
+            say(f"   ⚠ indeks {PICK} skor rendah ({sel.get('score')}) — "
+                "dipakai apa adanya karena dipilih eksplisit.")
     DP = str(sel["detailPath"])
     is_tv = (sel.get("subjectType") == 2)
     judul = sel.get("title") or "film"
@@ -1585,6 +1704,18 @@ def abyss_put_subtitle(jwt, slug, language, filename, vtt_text):
             return code
         time.sleep(6)
     return code
+
+
+def main():
+    if not TITLE:
+        fail("Input 'judul' kosong — isi kata kunci pencarian.")
+    if not ABYSS_KEY:
+        fail("Secret ABYSS_KEY belum diset di repo.")
+    if EPISODES_SPEC and REUSE_SLUG:
+        fail("Input 'episodes' (bulk) tidak bisa dipakai bersama 'slug_lama' ")
+    if SOURCE == "lk21":
+        return main_lk21()
+    return run_moviebox()
 
 
 if __name__ == "__main__":

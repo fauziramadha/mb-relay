@@ -162,7 +162,11 @@ def lk_domain():
 # ---------------------------------------------------------------------
 
 def lk_search(kw, domain=None):
-    """Cari judul → daftar {title, year, slug} (posting film/serial)."""
+    """Cari judul → daftar {title, year, slug, kind, ep} (posting
+    film/serial). Task 96d: dukung skema URL LK21 baru — series di
+    /tv/<judul>/ dan episode di /eps/<judul>-episode-N/ (slug kini berisi
+    path RELATIF PENUH, mis. "tv/agent-kim-reactivated"), sambil tetap
+    membaca slug tunggal gaya lama (/kung-fu-soccer-2026/)."""
     domain = domain or lk_domain()
     r = lk_http(f"{domain}/?s={urllib.parse.quote(kw)}")
     html = r.read().decode("utf-8", "replace")
@@ -170,9 +174,11 @@ def lk_search(kw, domain=None):
     root = urllib.parse.urlsplit(domain).netloc
     out, seen = [], set()
     for m in re.finditer(
-            rf'href="https?://{re.escape(root)}/([a-z0-9][a-z0-9-]{{3,90}})/"',
+            rf'href="https?://{re.escape(root)}/((?:tv|eps)/)?'
+            rf'([a-z0-9][a-z0-9-]{{3,90}})/"',
             html):
-        slug = m.group(1)
+        subdir, last = (m.group(1) or "").strip("/"), m.group(2)
+        slug = (subdir + "/" if subdir else "") + last
         if slug in seen or any(s in slug for s in (
                 "film-semi", "blog-category", "cast/", "genre/", "country/",
                 "director/", "contact-us", "dmca", "faq", "best-rating",
@@ -180,12 +186,124 @@ def lk_search(kw, domain=None):
                 "tag/", "season/")):
             continue
         seen.add(slug)
-        parts = slug.rstrip("/").split("-")
+        # episode post? (skema baru: eps/<judul>-episode-N)
+        ep = 0
+        m_ep = re.search(r"-episode-(\d+)$", last)
+        base = last[:m_ep.start()] if m_ep else last
+        kind = "episode" if m_ep else ("tv" if subdir == "tv" else "")
+        if m_ep:
+            ep = int(m_ep.group(1))
+            kind = "episode"
+        parts = base.split("-")
         year = parts[-1] if parts and parts[-1].isdigit() and \
             len(parts[-1]) == 4 else ""
         title = " ".join(parts[:-1] if year else parts).title()
-        out.append({"slug": slug, "title": title or slug, "year": year})
+        out.append({"slug": slug, "title": title or slug, "year": year,
+                    "kind": kind, "ep": ep})
     return out
+
+
+# --- Task 96d: skor relevansi + pencarian tahan-benda -----------------
+#  DUA jebakan LK21 yang membuat run user gagal ("Agent Kim Reactivated"):
+#  (1) judul yang TIDAK ada → tema menampilkan daftar unggahan terbaru
+#      (sampah, termasuk judul dewasa) — dipilih buta oleh pick [0];
+#  (2) WP-search kadang gagal utk query panjang ("Agent Kim Reactivated"
+#      → 0 hasil) padahal judulnya ADA dan ketemu dgn "Agent Kim".
+#  Solusi: coba query penuh → potongan kata depan; skor setiap hasil
+#  terhadap query ASLI; tolong yang skor < ambang; filter judul dewasa.
+
+_ADULT_WORDS = ("sex", "porn", "bokep", "hentai", "erotic", "xxx",
+                "film-semi", "semi-", "-semi")
+
+
+def _tok(s):
+    """Token kata: lowercase alnum, buang 's' posesif/plural ringan."""
+    toks = re.findall(r"[a-z0-9]+", (s or "").lower())
+    return {(t[:-1] if len(t) > 3 and t.endswith("s") else t) for t in toks}
+
+
+def _score(query, item):
+    """Skor relevansi 0..1: seberapa banyak token query (tanpa token
+    tahun) muncul di token judul/slug hasil. Bonus kecil bila tahun
+    query cocok. Toko tahun diabaikan supaya "Moana 2026" tetap cocok
+    dgn judul "Moana"."""
+    q_raw = _tok(query)
+    q_year = {t for t in q_raw if t.isdigit() and len(t) == 4}
+    q = q_raw - q_year
+    if not q:
+        q = q_raw or {""}
+    hay = _tok((item.get("title") or "") + " " + (item.get("slug") or ""))
+    hit = len(q & hay) / max(1, len(q))
+    if q_year and item.get("year") and item["year"] in q_year:
+        hit = min(1.0, hit + 0.15)
+    return hit
+
+
+def lk_find(query, domain=None, log=None):
+    """Pencarian pintar (Task 96d): multi-strategi + skor relevansi.
+    Kembalikan (results_terurut, query_dipakai) — results memuat field
+    'score'; hasil skor < LK_MIN_SCORE (0.6) dianggap tidak relevan
+    oleh pemanggil. Strategi: query penuh → buang kata terakhir
+    berulang (min 1 kata). Berhenti saat ada hasil skor ≥ ambang.
+    Semua hasil tetap DISKOR terhadap query ASLI, bukan potongannya —
+    supaya query "Agent" sendirian tidak bisa menipu."""
+    def say(*a):
+        if log:
+            log(*a)
+
+    q_words = query.split()
+    attempts, tried = [], set()
+    n = len(q_words)
+    while n >= 1 and len(attempts) < 4:
+        q_try = " ".join(q_words[:n])
+        if q_try.lower() in tried:
+            break
+        tried.add(q_try.lower())
+        attempts.append(q_try)
+        n -= 1
+
+    best, best_q, best_top = [], query, 0.0
+    for q_try in attempts:
+        try:
+            raw = lk_search(q_try, domain)
+        except Exception as e:
+            say(f"  lk_search('{q_try}') gagal: {repr(e)[:80]}")
+            continue
+        # filter dewasa SEBELUM diskor — jangan pernah tawarkan judul
+        # konten dewasa sebagai hasil otomatis
+        clean = [it for it in raw
+                 if not any(w in (it.get("slug") or "").lower()
+                            or w in " ".join(_tok(it.get("title") or ""))
+                            for w in _ADULT_WORDS)]
+        for it in clean:
+            it["score"] = round(_score(query, it), 2)
+        ranked = sorted(clean, key=lambda x: -x["score"])
+        top = ranked[0]["score"] if ranked else 0.0
+        say(f"  query '{q_try}' → {len(raw)} mentah, {len(clean)} bersih, "
+            f"skor teratas {top:.2f}")
+        if top > best_top:
+            best, best_q, best_top = ranked, q_try, top
+        if best_top >= 0.6:
+            break
+
+    # konsolidasi: jangan biarkan 10 post-episode judul yang sama
+    # membanjiri daftar — 1 entri per judul-dasar. Halaman /tv/ (series)
+    # menang; kalau tidak ada, wakil = post-episode nomor terkecil.
+    groups = {}
+    for it in best:
+        key = re.sub(r"^(?:tv|eps)/", "", it["slug"])
+        key = re.sub(r"-episode-\d+$", "", key)
+        cur = groups.get(key)
+        if cur is None:
+            groups[key] = it
+        elif cur["kind"] != "tv" and it["kind"] == "tv":
+            # halaman /tv/ (series) selalu menang jadi wakil grup
+            groups[key] = it
+        elif (cur["kind"] == "episode" and it["kind"] == "episode"
+              and it["ep"] < cur["ep"]):
+            groups[key] = it
+    best = sorted(groups.values(), key=lambda x: -x["score"])
+    return best, best_q
 
 
 def lk_detail(slug, domain=None):
@@ -202,17 +320,23 @@ def lk_detail(slug, domain=None):
 
     # --- link episode utk SERIES ---
     episode_links = []
+    # Task 96d: tangkap path PENUH — episode kini hidup di bawah
+    # /eps/ (dan mungkin prefiks lain); tanpa prefiks, lk_detail akan
+    # salah membangun URL halaman episode.
     for m in re.finditer(
-            rf'href="https?://[^"]*?/([a-z0-9-]+-episode-\d+)/?"', html):
+            rf'href="https?://[^"]*?/((?:[a-z0-9-]{{1,12}}/)?'
+            rf'[a-z0-9-]+-episode-\d+)/?"', html):
         ep_slug = m.group(1)
         if ep_slug not in episode_links:
             episode_links.append(ep_slug)
 
     # --- iframe player (Byse & keluarga /e/<code>) — JALUR UTAMA V2 ---
+    # Task 96d: src kadang punya path tambahan setelah kode
+    # (/e/<code>/judul-720p…) — byse_resolve hanya butuh /e/<code> di awal.
     byse = []
     for m in re.finditer(
-            r'<iframe[^>]+src="(https?://([^/]+)/e/([a-zA-Z0-9_-]{4,}))"',
-            html):
+            r'<iframe[^>]+src="(https?://([^/]+)/e/([a-zA-Z0-9_-]{4,}))'
+            r'(?:/[a-zA-Z0-9_.%-]*)?"', html):
         if m.group(1) not in byse:
             byse.append(m.group(1))
 
@@ -1100,8 +1224,16 @@ def resolve_title(title, pick=0, quality="auto", season=1, episode=1,
         if episode not in eps:
             raise RuntimeError(f"Episode {episode} tidak ada di LK21 "
                                f"(tersedia: {eps[:20]}…)")
-        base_slug = re.sub(r"-episode-\d+$", "", target_slug)
-        target_slug = f"{base_slug}-episode-{episode}"
+        # Task 96d: pakai path PENUH dari episode link bila ada
+        # (skema /eps/...); fallback bangun slug gaya lama.
+        target_slug = next(
+            (e for e in det["episode_links"]
+             if re.search(r"episode-(\d+)$", e)
+             and int(re.search(r"episode-(\d+)$", e).group(1)) == episode),
+            None)
+        if not target_slug:
+            base_slug = re.sub(r"-episode-\d+$", "", sel["slug"])
+            target_slug = f"{base_slug}-episode-{episode}"
         det = lk_detail(target_slug, dom)
 
     got = resolve_from_detail(det, quality, log)
