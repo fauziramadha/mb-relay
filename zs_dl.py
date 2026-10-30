@@ -1620,13 +1620,14 @@ def main_manual():
     reg = register_one(slug, ep if is_tv else 1, res, size, None, None,
                        is_tv, retries=3)
     say("\n" + "=" * 58)
-    if reg.get("ok"):
-        say("SUKSES! Judul TERSEDIA di Server 3 situs (sumber manual "
-            f"[{res}p]).")
-    elif reg.get("skip"):
+    # cek skip DULU — register_one kembali ok=True+skip utk token kosong
+    if reg.get("skip"):
         say(f"SELESAI (upload OK, [{res}p]). Slug: {slug} — register "
             "dilewati: token kosong. Isi token di panel lalu pakai "
             "mode register-saja (slug_lama) untuk mendaftarkan.")
+    elif reg.get("ok"):
+        say("SUKSES! Judul TERSEDIA di Server 3 situs (sumber manual "
+            f"[{res}p]).")
     else:
         say(f"SELESAI (upload OK). Slug: {slug} — register GAGAL: "
             f"{str(reg.get('error'))[:120]}")
