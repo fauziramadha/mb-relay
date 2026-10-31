@@ -231,6 +231,51 @@ def mb_search(kw):
     return out
 
 
+def mb_url_slug(text):
+    """Task 99: deteksi input = URL/slug detail MovieBox → detailPath.
+    Terima:
+      - https://officialmoviebox.com/moviesDetail/<slug>?id=…&utm… (share)
+      - domain apa pun + path moviesDetail/<slug>
+      - slug pola MovieBox: kata-kata + sufiks 11-char campuran (harus
+        ada huruf besar — kata Inggris biasa tidak akan lolos)
+    Return detailPath atau None."""
+    t = (text or "").strip()
+    m = re.search(r"moviesDetail/([A-Za-z0-9][A-Za-z0-9-]{1,120})", t)
+    if m:
+        return m.group(1).rstrip("/-")
+    if re.fullmatch(r"[a-z0-9][a-z0-9-]{1,120}-[A-Za-z0-9]{11}", t) \
+       and re.search(r"[A-Z]", t.split("-")[-1]):
+        return t
+    return None
+
+
+def mb_detail_meta(dp):
+    """Task 99: metadata halaman detail MovieBox TANPA pencarian —
+    untuk judul yang ada di website tapi TIDAK terindeks API pencarian
+    (kejadian nyata: 'Take Charge of My Heart' & 'Wildwood[CAM]',
+    30 Okt 2026). Kembalikan dict mirip hasil pencarian
+    (title/subjectType/releaseDate/hasResource/detailPath) atau None."""
+    html = mb_http(f"{H5}/moviesDetail/{dp}").read().decode("utf-8", "replace")
+    root = mb_nuxt(html)
+    if not root:
+        return None
+    best = {}
+
+    def fn(o, path):
+        if (isinstance(o, dict) and "title" in o and "subjectType" in o
+                and str(o.get("detailPath") or "") == dp):
+            best.clear()
+            best.update(o)
+    mb_walk(root, fn)
+    if not best:
+        return None
+    return {"title": best.get("title") or dp,
+            "subjectType": best.get("subjectType"),
+            "releaseDate": best.get("releaseDate") or "",
+            "detailPath": dp,
+            "hasResource": best.get("hasResource")}
+
+
 def mb_play(domain, detail_path, se=0, ep=0):
     url = (f"{domain}/wefeed-h5api-bff/subject/play?subjectId=0"
            f"&se={se}&ep={ep}&detailPath={urllib.parse.quote(detail_path)}")
@@ -1925,67 +1970,85 @@ def mb_rank(results, query):
 def run_moviebox(from_lk_fallback=False):
     """Alur sumber MovieBox (dipanggil langsung ATAU sbg fallback LK21).
     Task 96d: hasil diskor relevansi; pick [0] = ter-relevan; 0 hasil
-    relevan → fallback OTOMATIS ke LK21."""
+    relevan → fallback OTOMATIS ke LK21.
+    Task 99: input judul boleh URL detail MovieBox (moviesDetail/…)
+    → LOMPAT pencarian — judul yang tidak terindeks API pencarian
+    tetap bisa diunduh; halaman tanpa file video → fallback LK21."""
     egress = mb_ip()
     say(f"ZS pipeline — runner GitHub (Azure)\nIP egress: {egress}\n")
     summary_line(f"# ZS Download — {TITLE}")
     summary_line(f"- IP runner: `{egress}`")
 
-    # 1. cari judul
-    results = mb_search(TITLE)
-    if not results:
-        if from_lk_fallback:
-            fail(f"Judul '{TITLE}' tidak ditemukan di LK21 maupun "
-                 "MovieBox — coba kata kunci lain.")
-        say("MovieBox: 0 hasil — lanjut OTOMATIS dengan sumber LK21…")
-        summary_line("- MovieBox: 0 hasil → **fallback LK21**")
-        return main_lk21(from_mb_fallback=True)
-    results, relevant = mb_rank(results, TITLE)
-    say(f"Hasil pencarian MovieBox '{TITLE}': {len(results)} judul — "
-        f"{len(relevant)} relevan")
-    listing = ["\n## Hasil pencarian\n"]
-    for i, it in enumerate(results[:20]):
-        year = (it.get("releaseDate") or "")[:4]
-        jenis = "SERIAL" if it.get("subjectType") == 2 else "Film"
-        flag = "" if it.get("hasResource") is not False else " [belum ada video]"
-        line = (f"[{i:>2}] {it.get('score', 0):.2f} {jenis:<6} "
-                f"{it.get('title', '?')} ({year}){flag}")
-        say("  " + line)
-        listing.append(f"- `{i}` {jenis} **{it.get('title', '?')}** "
-                       f"({year}) — skor {it.get('score', 0)}{flag}")
-    summary_line("\n".join(listing))
-
-    if not relevant:
-        if from_lk_fallback:
-            fail(f"Judul '{TITLE}' tidak ditemukan relevan di LK21 maupun "
-                 "MovieBox. Hasil pencarian hanya judul lain yang mirip — "
-                 "cek ejaan / pakai judul Inggris resmi.")
-        say("\n🔁 MovieBox tidak punya judul ini (0 hasil relevan) — "
-            "lanjut OTOMATIS dengan sumber LK21…")
-        summary_line("- MovieBox: 0 hasil relevan → **fallback LK21**")
-        return main_lk21(from_mb_fallback=True)
-
-    if PICK < 0 or PICK >= len(results):
-        fail(f"Pilihan indeks {PICK} di luar daftar (0..{len(results)-1}). "
-             "Lihat daftar di atas, jalankan ulang workflow dengan 'pilihan' "
-             "yang benar.")
-    if PICK == 0:
-        idx = results.index(relevant[0])
-        if idx != 0:
-            say(f"   pilihan otomatis [0] → indeks {idx} "
-                f"({relevant[0].get('title')} — paling relevan)")
-        sel = relevant[0]
+    # Task 99 — input = URL detail MovieBox → LANGSUNG pakai detailPath
+    # (judul ada di website tapi tidak muncul di hasil pencarian)
+    url_dp = None if from_lk_fallback else mb_url_slug(TITLE)
+    if url_dp:
+        sel = mb_detail_meta(url_dp)
+        if not sel:
+            fail(f"Halaman detail MovieBox '{url_dp}' tidak terbaca — "
+                 "buka link-nya di browser untuk memastikan masih hidup.")
+        say("🔗 Input = URL detail MovieBox → LOMPAT pencarian "
+            "(indeks pencarian MovieBox memang tidak punya judul ini)")
+        summary_line(f"- Input: URL detail MovieBox `{url_dp}` "
+                     "(lompat pencarian)")
     else:
-        sel = results[PICK]
-        if sel.get("score", 0) < 0.6:
-            say(f"   ⚠ indeks {PICK} skor rendah ({sel.get('score')}) — "
-                "dipakai apa adanya karena dipilih eksplisit.")
+        # 1. cari judul
+        results = mb_search(TITLE)
+        if not results:
+            if from_lk_fallback:
+                fail(f"Judul '{TITLE}' tidak ditemukan di LK21 maupun "
+                     "MovieBox — coba kata kunci lain.")
+            say("MovieBox: 0 hasil — lanjut OTOMATIS dengan sumber LK21…")
+            summary_line("- MovieBox: 0 hasil → **fallback LK21**")
+            return main_lk21(from_mb_fallback=True)
+        results, relevant = mb_rank(results, TITLE)
+        say(f"Hasil pencarian MovieBox '{TITLE}': {len(results)} judul — "
+            f"{len(relevant)} relevan")
+        listing = ["\n## Hasil pencarian\n"]
+        for i, it in enumerate(results[:20]):
+            year = (it.get("releaseDate") or "")[:4]
+            jenis = "SERIAL" if it.get("subjectType") == 2 else "Film"
+            flag = "" if it.get("hasResource") is not False else " [belum ada video]"
+            line = (f"[{i:>2}] {it.get('score', 0):.2f} {jenis:<6} "
+                    f"{it.get('title', '?')} ({year}){flag}")
+            say("  " + line)
+            listing.append(f"- `{i}` {jenis} **{it.get('title', '?')}** "
+                           f"({year}) — skor {it.get('score', 0)}{flag}")
+        summary_line("\n".join(listing))
+
+        if not relevant:
+            if from_lk_fallback:
+                fail(f"Judul '{TITLE}' tidak ditemukan relevan di LK21 maupun "
+                     "MovieBox. Hasil pencarian hanya judul lain yang mirip — "
+                     "cek ejaan / pakai judul Inggris resmi.")
+            say("\n🔁 MovieBox tidak punya judul ini (0 hasil relevan) — "
+                "lanjut OTOMATIS dengan sumber LK21…")
+            summary_line("- MovieBox: 0 hasil relevan → **fallback LK21**")
+            return main_lk21(from_mb_fallback=True)
+
+        if PICK < 0 or PICK >= len(results):
+            fail(f"Pilihan indeks {PICK} di luar daftar (0..{len(results)-1}). "
+                 "Lihat daftar di atas, jalankan ulang workflow dengan 'pilihan' "
+                 "yang benar.")
+        if PICK == 0:
+            idx = results.index(relevant[0])
+            if idx != 0:
+                say(f"   pilihan otomatis [0] → indeks {idx} "
+                    f"({relevant[0].get('title')} — paling relevan)")
+            sel = relevant[0]
+        else:
+            sel = results[PICK]
+            if sel.get("score", 0) < 0.6:
+                say(f"   ⚠ indeks {PICK} skor rendah ({sel.get('score')}) — "
+                    "dipakai apa adanya karena dipilih eksplisit.")
+        say(f"\nTerpilih: {sel.get('title')} "
+            f"({(sel.get('releaseDate') or '')[:4]}) — "
+            f"{'SERIAL' if sel.get('subjectType') == 2 else 'Film'}")
+
     DP = str(sel["detailPath"])
     is_tv = (sel.get("subjectType") == 2)
     judul = sel.get("title") or "film"
     tahun = (sel.get("releaseDate") or "")[:4]
-    say(f"\nTerpilih: {judul} ({tahun}) — "
-        f"{'SERIAL' if is_tv else 'Film'}")
 
     # 2. resolve stream
     DOMAIN = mb_domain()
@@ -2014,8 +2077,21 @@ def run_moviebox(from_lk_fallback=False):
     data = pj.get("data") or {}
     streams = [s for s in (data.get("streams") or []) if not s.get("vipLocked")]
     if not data.get("hasResource") or not streams:
-        fail("Tidak ada stream free — mungkin salah musim/episode atau judul "
-             "belum punya video. Lihat daftar hasil pencarian di atas.")
+        # Task 99: halaman detail ADA tapi file videonya belum diupload
+        # MovieBox (placeholder — kejadian 'Wildwood[CAM]'). Jangan asal
+        # gagal: coba LK21 dgn judul bersih (tanpa tag [CAM] dsb).
+        bersih = re.sub(r"\[[^\]]*\]", "", judul).strip() or judul
+        if not from_lk_fallback:
+            say(f"\n⚠ Halaman MovieBox judul '{judul}' ADA tapi belum "
+                "punya file video (placeholder / masih diproses).")
+            say("   Lanjut OTOMATIS dengan sumber LK21…")
+            summary_line("- MovieBox: halaman ada, 0 stream → "
+                         "**fallback LK21**")
+            globals()["TITLE"] = bersih
+            return main_lk21(from_mb_fallback=True)
+        fail(f"Halaman MovieBox judul '{judul}' belum punya file video "
+             "(placeholder) dan LK21 juga tidak menyediakannya. Coba lagi "
+             "nanti, atau pakai sumber manual (link portal LK21).")
     say("Kualitas tersedia: " + ", ".join(
         f"{s.get('resolutions')}p" for s in streams))
     stream = _choose_stream(streams, QUALITY)

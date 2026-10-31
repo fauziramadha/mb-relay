@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       judul:
-        description: "Judul film/serial (kata kunci pencarian; Inggris lebih akurat)"
+        description: "Judul/kata kunci pencarian — ATAU URL detail MovieBox (moviesDetail/…, Task 99: lompat pencarian utk judul yang tak terindeks)"
         required: true
       sumber:
         description: "Sumber unduhan (Task 96 + 97)"

@@ -222,14 +222,27 @@ def _tok(s):
     return {(t[:-1] if len(t) > 3 and t.endswith("s") else t) for t in toks}
 
 
+# Task 99: token NOISE = tag kualitas/bahasa yang menempel di banyak
+# judul (bukan kata judul). Wajib dibuang dari sisi QUERY sebelum
+# diskor — tanpa ini 'Wildwood[CAM] 2026' cocok 0.65 ke SEMUA film
+# [CAM] 2026 (kejadian nyata: 'Dhood (Sandstorm)[CAM]' terpilih &
+# terunduh utk permintaan Wildwood, 30 Okt 2026).
+NOISE_TOK = {
+    "cam", "hdcam", "hd", "hdrip", "web", "webdl", "webrip", "hdts",
+    "telesync", "bluray", "brrip", "dvdrip", "dvdscr", "screener",
+    "english", "indonesia", "indo", "sub", "subbed", "dub", "dubbed",
+    "official", "trailer", "teaser", "full", "movie", "film",
+}
+
+
 def _score(query, item):
     """Skor relevansi 0..1: seberapa banyak token query (tanpa token
-    tahun) muncul di token judul/slug hasil. Bonus kecil bila tahun
-    query cocok. Toko tahun diabaikan supaya "Moana 2026" tetap cocok
-    dgn judul "Moana"."""
+    tahun, tanpa token noise tag kualitas) muncul di token judul/slug
+    hasil. Bonus kecil bila tahun query cocok. Token tahun diabaikan
+    supaya "Moana 2026" tetap cocok dgn judul "Moana"."""
     q_raw = _tok(query)
     q_year = {t for t in q_raw if t.isdigit() and len(t) == 4}
-    q = q_raw - q_year
+    q = q_raw - q_year - NOISE_TOK
     if not q:
         q = q_raw or {""}
     hay = _tok((item.get("title") or "") + " " + (item.get("slug") or ""))
