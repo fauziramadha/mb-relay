@@ -680,6 +680,23 @@ def abyss_upload(file_path, log=lambda s: None):
       baru di katalog (server lambat memproses ≠ upload gagal)
     """
     size = os.path.getsize(file_path)
+    # [Task 103] cek integritas struktur video (log-only, tak pernah memblokir):
+    # MP4 → validasi rantai NAL tiap sampel via moov; TS → sync byte 0x47.
+    # Diagnosa 1 Nov 2026: sengaja WARNING-ONLY — sumber MovieBox terbukti
+    # BERSIH (dugaan korupsi awal ternyata artefak unduhan-terpotong);
+    # nilai nyata = telemetri bila kelak ada sumber yang benar-benar rusak.
+    try:
+        from zs_media_check import check_file as _mc
+        rep = _mc(file_path)
+        if rep.get("format") in ("mp4", "ts") and rep.get("checked", 0) > 50:
+            if rep.get("corrupt"):
+                log(f"  ⚠ INTEGRITAS: {rep['corrupt']}/{rep['checked']} sampel rusak "
+                    f"(detik ~{rep.get('pts_corrupt', [])[:4]}) — file tetap diunggah, "
+                    f"tontonan mungkin beku di titik itu")
+            else:
+                log(f"  ✓ integritas video OK ({rep['checked']} sampel {rep['format']})")
+    except Exception:
+        pass
     base = os.path.basename(file_path)
     pre = {it.get("slug") for it in abyss_list_items()}
     # jatah waktu per endpoint (mnt): utama longgar, fallback mengecil —
