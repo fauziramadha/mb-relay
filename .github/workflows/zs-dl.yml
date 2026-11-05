@@ -143,20 +143,43 @@ jobs:
           python3 - <<'PY'
           import json, os, urllib.request
           PAT = os.environ["CODES_PAT"]
-          req = urllib.request.Request(
-              "https://api.github.com/user/codespaces?per_page=25",
-              headers={"Authorization": f"Bearer {PAT}",
-                       "Accept": "application/vnd.github+json"})
-          data = json.load(urllib.request.urlopen(req, timeout=60))
+
+          def gh_api(path, method="GET", body=None):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  data=json.dumps(body).encode() if body else None,
+                  method=method,
+                  headers={"Authorization": f"Bearer {PAT}",
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read() or b"{}")
+
+          data = gh_api("/user/codespaces?per_page=25")
           cs = [c for c in data.get("codespaces", [])
                 if c.get("repository", {}).get("full_name") ==
                 "fauziramadha/mb-relay" and c.get("state") != "Deleted"]
           if not cs:
-              raise SystemExit("Codespace mb-relay tidak ditemukan — buat "
-                               "dari repo (Code → Codespaces → Create).")
-          c0 = sorted(cs, key=lambda c: c.get("last_used_at") or "",
-                      reverse=True)[0]
-          print("codespace:", c0["name"], "| state:", c0["state"])
+              # [Task 105] codespace hilang → BUAT BARU dengan idle-timeout
+              # 240 mnt. Default 30 mnt mematikan codespace di TENGAH job
+              # (semua proses di dalamnya daemon tanpa aktivitas terminal,
+              # jadi GitHub menganggapnya idle — kasus nyata 5 Nov 2026:
+              # unduh 309 MB selesai, upload jalan, codespace tewas, proxy
+              # app.github.dev mulai menolak 401). Idle timeout hanya bisa
+              # di-set saat CREATE (PATCH pada codespace lama diabaikan).
+              print("Codespace mb-relay tidak ditemukan — membuat baru "
+                    "(idle-timeout 240 mnt)…")
+              rid = gh_api("/repos/fauziramadha/mb-relay")["id"]
+              c0 = gh_api("/user/codespaces", "POST",
+                          {"repository_id": rid, "ref": "main",
+                           "idle_timeout_minutes": 240})
+              print("codespace dibuat:", c0.get("name"),
+                    "| idle-timeout:", c0.get("idle_timeout_minutes"), "mnt")
+          else:
+              c0 = sorted(cs, key=lambda c: c.get("last_used_at") or "",
+                          reverse=True)[0]
+              print("codespace:", c0["name"], "| state:", c0["state"],
+                    "| idle-timeout:", c0.get("idle_timeout_minutes"), "mnt")
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"CS_NAME={c0['name']}\n")
               f.write(f"CS_STATE={c0['state']}\n")
@@ -241,6 +264,10 @@ jobs:
 
           BASE = os.environ["RELAY_URL"]
           KEY = os.environ["ZS_EXEC_KEY"]
+          PAT = os.environ.get("CODES_PAT", "")
+          CS = os.environ.get("CS_NAME", "")
+          JOB_CMD = ("cd /workspaces/mb-relay && "
+                     "python3 zs_dl.py /tmp/zs-params.json")
 
           def post(path, obj):
               req = urllib.request.Request(
@@ -256,12 +283,24 @@ jobs:
               with urllib.request.urlopen(req, timeout=60) as r:
                   return json.loads(r.read())
 
+          def gh_api(path, method="GET", body=None):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  data=json.dumps(body).encode() if body else None,
+                  method=method,
+                  headers={"Authorization": f"Bearer {PAT}",
+                           "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.loads(r.read() or b"{}")
+
           # 1. kirim parameter (base64 agar aman dari quoting shell)
           params = open(os.environ["RUNNER_TEMP"] +
                         "/zs-params.json", "rb").read()
           b64 = base64.b64encode(params).decode()
-          r = post("/exec", {"cmd":
-                  f"echo {b64} | base64 -d > /tmp/zs-params.json && echo OK"})
+          SEND_PARAMS = (f"echo {b64} | base64 -d > /tmp/zs-params.json "
+                         "&& echo OK")
+          r = post("/exec", {"cmd": SEND_PARAMS})
           print("kirim params:", r.get("code"), r.get("out", "")[:40])
           assert "OK" in r.get("out", ""), f"gagal kirim params: {r}"
 
@@ -279,19 +318,109 @@ jobs:
                 out1b[-1] if out1b else "(tanpa jawaban)")
 
           # 2. mulai pekerjaan panjang di codespace
-          cmd = ("cd /workspaces/mb-relay && "
-                 "python3 zs_dl.py /tmp/zs-params.json")
-          r = post("/jobstart", {"cmd": cmd})
+          r = post("/jobstart", {"cmd": JOB_CMD})
           print("pekerjaan dimulai:", r)
           assert r.get("started"), f"jobstart gagal: {r}"
 
-          # 3. pantau log sampai selesai (maks 2,5 jam — Task 96c: upload
-          #    Abyss kini rotasi-endpoint, file besar butuh ruang); log
-          #    penuh ditampung untuk deteksi marker sisa episode bulk (Task 92)
+          # 3. pantau log sampai selesai (maks ±2,5 jam + kompensasi
+          #    restart). [Task 105] TAHAN GANGGUAN PROXY app.github.dev:
+          #    codespace bisa MATI IDLE-TIMEOUT (default 30 mnt) di tengah
+          #    job — semua proses di dalamnya daemon tanpa aktivitas
+          #    terminal, sehingga GitHub menganggap codespace idle dan
+          #    mematikannya WALAU unduh/upload sedang berjalan (kasus
+          #    nyata 5 Nov 2026: 309 MB selesai terunduh, upload jalan,
+          #    codespace tewas, proxy mulai menolak 401 dan monitor LAMA
+          #    langsung crash → job gagal padahal pipeline sehat).
+          #    Kini: polling tahan-banting → cek state codespace → bila
+          #    mati: nyalakan ulang + JALANKAN LAGI job (zs_dl.py resume
+          #    otomatis: state-file per seri + mp4 utuh di disk persisten
+          #    + deteksi 416 + register idempoten per token).
+          def cs_state():
+              try:
+                  return gh_api(f"/user/codespaces/{CS}").get("state")
+              except Exception:
+                  return "?"
+
+          def start_and_wait():
+              """Nyalakan codespace + tunggu relay hidup (pola step
+              bangunkan: POST /start ulang tiap ±60 dtk menutup race
+              shutdown). Return True bila /healthz menjawab ok."""
+              t0, last_post = time.time(), 0.0
+              while time.time() - t0 < 420:
+                  if time.time() - last_post > 55:
+                      try:
+                          gh_api(f"/user/codespaces/{CS}/start", "POST", {})
+                      except Exception:
+                          pass
+                      last_post = time.time()
+                  if cs_state() == "Available":
+                      break
+                  time.sleep(10)
+              if cs_state() != "Available":
+                  return False
+              t1 = time.time()
+              while time.time() - t1 < 360:   # port public self-healing
+                  try:
+                      rr = urllib.request.urlopen(BASE + "/healthz",
+                                                  timeout=15)
+                      if rr.read() == b"ok":
+                          return True
+                  except Exception:
+                      pass
+                  time.sleep(10)
+              return False
+
           off, deadline, exit_code = 0, time.time() + 9000, None
-          full_log = ""
+          full_log, err_streak, restarts = "", 0, 0
           while time.time() < deadline:
-              j = get(f"/joblog?from={off}")
+              j = None
+              try:
+                  j = get(f"/joblog?from={off}")
+                  err_streak = 0
+              except Exception as e:
+                  err_streak += 1
+                  if err_streak == 3:
+                      print(f"  ! /joblog terputus ({repr(e)[:90]}) — "
+                            "periksa codespace…", flush=True)
+                  if err_streak >= 3:
+                      st = cs_state()
+                      if st in ("Shutdown", "ShuttingDown"):
+                          if restarts >= 5:
+                              raise SystemExit("codespace mati berulang "
+                                               ">5× — berhenti (job bisa "
+                                               "dilanjutkan: jalankan "
+                                               "ulang workflow, resume "
+                                               "otomatis).")
+                          restarts += 1
+                          print(f"  ↻ codespace MATI (idle timeout) — "
+                                f"nyalakan ulang #{restarts}…", flush=True)
+                          if start_and_wait():
+                              try:
+                                  post("/exec", {"cmd": SEND_PARAMS})
+                                  r2 = post("/jobstart", {"cmd": JOB_CMD})
+                                  print("  ↻ job DILANJUTKAN (resume dari "
+                                        "state Codespace)", flush=True)
+                                  off, err_streak = 0, 0
+                                  deadline += 600     # kompensasi boot
+                                  continue
+                              except Exception as e2:
+                                  print("  ! resume gagal:",
+                                        repr(e2)[:80], flush=True)
+                          else:
+                              print("  ! codespace tak kunjung hidup — "
+                                    "coba lagi…", flush=True)
+                          time.sleep(15)
+                          continue
+                      if err_streak >= 36 and st == "Available":
+                          raise SystemExit(
+                              "proxy codespace tak terjangkau >6 mnt "
+                              "padahal state Available — kemungkinan "
+                              "visibilitas port 8080 ter-reset. Buka "
+                              "codespace di browser (terminal: "
+                              "sh public_port.sh) lalu jalankan ulang "
+                              "workflow (resume otomatis).")
+                  time.sleep(10)
+                  continue
               if j.get("size", 0) > off:
                   chunk = base64.b64decode(j.get("b64", "")) \
                       .decode("utf-8", "replace")

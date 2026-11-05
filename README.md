@@ -297,6 +297,7 @@ karakter.
 | Transcode Abyss > 15 menit | Tidak masalah — register tetap dilakukan; status bisa dicek di dashboard Abyss (player.abyssplayer.com). |
 | Subtitle tidak muncul di halaman film | Pastikan film terdaftar di katalog dulu, lalu cek **Admin → Subtitle**: bahasa/offset bisa dikoreksi & "pasang ulang ke player" di sana. |
 | `subtitles 403` / `HTTP 403` saat pasang subtitle | Sudah diperbaiki di versi sekarang (curl + UA browser). Kalau masih muncul: Codespace belum menarik kode terbaru → Restart Codespace sekali lalu run ulang. |
+| `urllib.error.HTTPError: HTTP Error 401` di tengah run (unduh/upload sehat lalu mendadak gagal) | **Bukan salah pipeline** — Codespace dimatikan GitHub karena **idle-timeout 30 menit**: semua proses di dalamnya (relay, zs_dl.py) berjalan sebagai daemon *tanpa aktivitas terminal*, jadi GitHub menganggapnya "idle" walau unduh/upload sedang berjalan; begitu mati, proxy `app.github.dev` menolak dengan 401. **Sudah otomatis sembuh (Task 105)**: monitor kini mendeteksi codespace mati → menyalakan ulang → menjalankan lagi job (resume dari state + mp4 utuh di disk — tanpa unduh ulang). Maksimal 5 restart per run. Disarankan juga: github.com → Settings → Codespaces → **Default idle timeout → 240 menit** (berlaku untuk Codespace baru; Codespace lama 30 mnt tidak bisa diubah — hapus lama, workflow otomatis membuat yang baru dengan timeout 240 mnt). |
 
 ---
 
@@ -346,6 +347,18 @@ rute Render juga ditinggalkan — wajib kartu + IP-nya diblokir CDN.)
   terupload tapi belum masuk katalog (lupa token) tinggal register
   ulang tanpa unduh 2,4 GB lagi; register juga kini retry saat Abyss
   masih mem-proses (jawaban 202).
+- **Task 105** (5 Nov 2026) — run hianime 309 MB gagal di menit ke-30
+  padahal unduh selesai & upload berjalan: Codespace tewas **idle-timeout
+  default 30 mnt** (daemon tanpa aktivitas terminal = "idle" menurut
+  GitHub) → proxy 401 → monitor lama crash. Tiga lapis perbaikan:
+  (1) monitor **tahan-banting** — polling /joblog di-retry, state
+  Codespace dicek via API, bila mati → **nyalakan ulang + jalankan lagi
+  job** (resume otomatis; maks 5×; jatah waktu +10 mnt per restart);
+  (2) **deteksi 416** di `hi_download` — mp4 yang sudah utuh di disk
+  langsung dianggap lengkap (dulu: mentok 12× percobaan sia-sia saat
+  resume); (3) Codespace yang hilang kini **dibuat otomatis** dengan
+  idle-timeout 240 mnt (default 30 mnt hanya bisa diubah saat create;
+  PATCH pada Codespace lama diabaikan — terukur langsung via API).
 
 ---
 

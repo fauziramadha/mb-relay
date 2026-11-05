@@ -2192,6 +2192,16 @@ def hi_download(page_url, out_path, max_refresh=12):
                     "ambil link baru…")
                 time.sleep(2)
                 continue
+            if e.code == 416 and pos:
+                # [Task 105] file lokal SUDAH lengkap: Range jenuh dijawab
+                # 416 + Content-Range "bytes */TOTAL" (terukur langsung di
+                # sumber, 5 Nov 2026). Tanpa ini, resume run yang terputus
+                # (codespace idle-timeout dsb.) mentok 12× percobaan sia-sia
+                # padahal mp4 utuh sudah ada di disk Codespace.
+                m16 = re.search(r"/(\d+)\s*$",
+                                e.headers.get("Content-Range") or "")
+                if m16 and pos >= int(m16.group(1)):
+                    return True, f"sudah lengkap ({pos/1e6:.0f} MB)"
             if e.code == 404:
                 return False, "file tidak ada (404) di server sumber"
             say(f"  [coba {attempt}] HTTP {e.code} → ulang…")
