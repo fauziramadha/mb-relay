@@ -216,12 +216,14 @@ pipeline ini memang on-demand (jalan hanya saat kamu meminta film).
 
 ---
 
-## Tiga sumber unduhan: MovieBox & LK21 (v2) & Link Manual (Task 97)
+## Empat sumber unduhan: MovieBox & LK21 (v2) & Link Manual (Task 97) & Hianime (Task 104b)
 
 Workflow `ZS Download` punya pilihan **`sumber`**: `moviebox` (utama),
 `lk21` (katalog Indonesia — hardsub/softsub, judul yang sering tidak ada
-di MovieBox, termasuk film China/Asia terbaru), dan **`manual`** (Task 97
-— link file final dari portal unduh LK21: Google Share/Mega/URL mp4).
+di MovieBox, termasuk film China/Asia terbaru), **`manual`** (Task 97
+— link file final dari portal unduh LK21: Google Share/Mega/URL mp4),
+dan **`hianime`** (Task 104b — anime dari hianime-dl.halahgan.com,
+lihat bagian khususnya di bawah).
 
 **Mengapa LK21 pernah gagal total (run 28-29 Okt):** semua tombol unduhan
 LK21 dibungkus shortlink **ouo.io** yang dilindungi Cloudflare Turnstile —
@@ -388,3 +390,62 @@ ke baris berikutnya sampai ada yang berhasil. Series: jumlah baris link harus
 - Panel Admin: textarea multi-link + grid episode (mode pasangan) +
   validasi jumlah baris ↔ episode (handlers.ts + admin/page.tsx Task 98).
 - Uji: `scripts/test-manual-multilink.py` (20 cek termasuk Mega LIVE).
+
+---
+
+## Sumber HIANIME — anime dari hianime-dl.halahgan.com (Task 104b, 5 Nov 2026)
+
+Cara pakai: **Actions → ZS Download → Run workflow** dengan
+**`sumber` = `hianime`** dan **`link`** = URL halaman download apa pun
+dari seri tsb (episode berapa pun — kualitas ikut URL), contoh:
+
+```
+https://hianime-dl.halahgan.com/download/Hi/Black_Clover/Ep_0001/1080p/Black_Clover_Ep_0001_1080p.mp4
+```
+
+Sisanya otomatis di dalam Codespace (mesin `main_hianime` zs_dl.py):
+
+1. **Daftar episode** dibaca dari halaman sumber (section "Episode lain",
+   paginasi 50/halaman diikuti sampai habis — Black Clover 169 ep dalam
+   ±3 dtk). Nomor = absolut.
+2. **Peta musim otomatis**: cari judul di TMDB (via proxy situs, tanpa
+   API key; input `pilihan` bila hasil ganda) → absolut → (musim,
+   episode). Token register = **scope-series per musim** → input
+   `musim` = musim token itu; episode milik musim lain dilewati dengan
+   pesan (jalankan run terpisah dengan token musim tsb). Bila situs
+   sumber menomori per-musim (ep list selalu mulai Ep_0001), terdeteksi
+   otomatis → peta datar abs n = S{musim}En. TMDB tak terjangkau →
+   fallback peta datar juga.
+3. **Unduh tahan kadaluarsa 6 jam**: setiap file dipanggil lewat
+   halaman download yang SELALU mencetak URL ter-sign baru
+   (`/file/…?iat&exp&sig`, `exp−iat` = tepat 6 jam). Mesin MINT link
+   segar tepat sebelum pakai; bila balas 403 (kadaluarsa) → mint ulang
+   → lanjut RESUME via Range — unduhan tak pernah diulang dari nol.
+   Stall 120 dtk juga ditangani (putus → mint → resume).
+4. **Subtitle VTT asli sumber** (10 bahasa: id/en/arabic/french/german/
+   italian/russian/spanish×2/portuguese) — dikirim ke katalog Server 3
+   (`srt:false`) + dipasang best-effort ke CC native player Abyss.
+   Input `subtitle`: `in_id` (default) / `en` / `none`, boleh list
+   `in_id,en` (maks 3). `id` tak ada → fallback en→ms→arabic.
+5. **Upload Abyss** memakai `abyss_upload()` v2 yang sama (rotasi
+   endpoint hydrax/abyss + guard stall + pemulihan katalog), tunggu
+   transcode ready, lalu register per episode.
+6. **Bulk + chunk otomatis ±2 jam** (budget 95 mnt): sisa episode
+   ditandai `ZS_BULK_REMAIN` → runner men-dispatch ulang workflow dengan
+   link + token + musim yang sama. **State per seri disimpan di Codespace
+   (`hi_dl/state-{Judul}.json`)**: episode yang sudah terdaftar dilewati,
+   yang sudah terupload tapi register gagal tinggal register ulang TANPA
+   unduh/upload lagi — chunk maupun run ulang aman di mana pun berhenti.
+7. **Register-saja per episode**: sudah pernah upload dari run/notebook
+   lain? isi `slug_lama` dengan pasangan `abs=slug` (mis.
+   `1=MxCWqhgPq,2=AbCd1234`) — unduh+upload dilewati, langsung register.
+
+Catatan kualitas: tidak semua judul punya semua kualitas (Black Clover
+hanya 1080p; 720p → 404) — input `kualitas` DIABAIKAN untuk sumber ini,
+kualitas diambil dari URL. Film anime (bukan serial): deteksi otomatis
+(tanpa daftar episode) atau isi `tipe` = `movie` + token movie.
+
+Uji lengkap: `scripts/test-hianime-pipeline.py` di sisi ZeeStream
+(engine live + dry-run alur + register-saja; 24 cek LULUS 5 Nov 2026,
+termasuk mint segar 6 jam, enumerasi 169 ep, VTT id 22.693 karakter,
+peta TMDB 73223 S1E1-5, penolakan token palsu yang bersih).

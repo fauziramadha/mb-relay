@@ -14,7 +14,7 @@ on:
         description: "Judul/kata kunci pencarian — ATAU URL detail MovieBox (moviesDetail/…, Task 99: lompat pencarian utk judul yang tak terindeks)"
         required: true
       sumber:
-        description: "Sumber unduhan (Task 96 + 97)"
+        description: "Sumber unduhan (Task 96 + 97 + 104b)"
         required: false
         default: "moviebox"
         type: choice
@@ -22,12 +22,13 @@ on:
           - moviebox
           - lk21
           - manual
+          - hianime
       link:
-        description: "[manual] Link file final — BOLEH BANYAK (pisah newline/spasi/koma): Cast/Vikingfile/Mega/Google Share dari portal LK21. Film/1 episode = dicoba berurutan sampai ada yang berhasil; series = jumlah baris harus = jumlah episode (baris n → episode n)"
+        description: "[manual] Link file final (Cast/Vikingfile/Mega/Google Share, boleh banyak). [hianime] URL halaman download hianime-dl.halahgan.com/download/... (episode apa pun dari seri; kualitas ikut URL; bulk = seluruh seri dari daftar episode)"
         required: false
         default: ""
       tipe:
-        description: "[manual] movie / tv (bentuk nama file + register episode)"
+        description: "[manual/hianime] movie / tv (hianime: kosong = deteksi otomatis dari daftar episode)"
         required: false
         default: ""
         type: choice
@@ -40,7 +41,7 @@ on:
         required: false
         default: "0"
       musim:
-        description: "Musim ke berapa (SERIAL saja; film biarkan 1)"
+        description: "Musim ke berapa (SERIAL; film biarkan 1). hianime: MUSIM TOKEN scope-series (peta episode otomatis dari TMDB)"
         required: false
         default: "1"
       episode:
@@ -48,7 +49,7 @@ on:
         required: false
         default: "1"
       episodes:
-        description: "BULK series: daftar/rentang episode, mis. 1-100 / 1,3,5-8 (kosong = mode tunggal input episode). Di-chunk otomatis ±2 jam per run"
+        description: "BULK series: daftar/rentang episode, mis. 1-100 / 1,3,5-8 (hianime juga: all = seluruh seri; kosong = mode tunggal input episode, KECUALI hianime = semua). Di-chunk otomatis ±2 jam per run"
         required: false
         default: ""
       budget_menit:
@@ -56,11 +57,11 @@ on:
         required: false
         default: "95"
       kualitas:
-        description: "auto / 1080 / 720 / 360 (default auto = tertinggi gratis)"
+        description: "auto / 1080 / 720 / 360 (default auto = tertinggi gratis). hianime: DIABAIKAN — kualitas terikat di URL link"
         required: false
         default: "auto"
       subtitle:
-        description: "in_id / ms / en / none (default in_id)"
+        description: "in_id / ms / en / none (default in_id; hianime boleh list: in_id,en — maks 3, subtitle situs = VTT asli sumber)"
         required: false
         default: "in_id"
       token:
@@ -68,7 +69,7 @@ on:
         required: false
         default: ""
       slug_lama:
-        description: "Slug Abyss run sebelumnya, mis. SGZKkyR9C (opsional; isi = register-saja TANPA unduh/upload ulang)"
+        description: "Slug Abyss run sebelumnya, mis. SGZKkyR9C (isi = register-saja TANPA unduh/upload ulang). hianime bulk: pasangan abs=slug, mis. 1=MxCWqhgPq,2=AbCd1234"
         required: false
         default: ""
 
@@ -336,6 +337,7 @@ jobs:
           LINK_REMAIN: ${{ steps.monitor.outputs.linkremain }}
           I_JUDUL: ${{ inputs.judul }}
           I_SUMBER: ${{ inputs.sumber }}
+          I_LINK: ${{ inputs.link }}
           I_TIPE: ${{ inputs.tipe }}
           I_PICK: ${{ inputs.pilihan }}
           I_MUSIM: ${{ inputs.musim }}
@@ -356,11 +358,18 @@ jobs:
                       base64.b64decode(os.environ["LINK_REMAIN"])))
               except Exception:
                   links_sisa = ""
+          # Task 104b: chunk hianime bawa LINK halaman sumbernya (tanpa ini
+          # chunk lanjutan tak tahu seri mana yang harus dilanjutkan)
+          sumber = (os.environ["I_SUMBER"] or "moviebox").strip()
+          link = links_sisa or (os.environ.get("I_LINK", "")
+                                if sumber == "hianime" else "")
+          tipe = (os.environ["I_TIPE"] or "") \
+              if (links_sisa or sumber == "hianime") else ""
           inputs = {
               "judul": os.environ["I_JUDUL"],
-              "sumber": os.environ["I_SUMBER"] or "moviebox",
-              "link": links_sisa,
-              "tipe": (os.environ["I_TIPE"] or "") if links_sisa else "",
+              "sumber": sumber,
+              "link": link,
+              "tipe": tipe,
               "pilihan": os.environ["I_PICK"] or "0",
               "musim": os.environ["I_MUSIM"] or "1",
               "episode": "1",

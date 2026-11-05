@@ -24,6 +24,10 @@
 #                runner men-dispatch chunk berikutnya otomatis
 #    ZS_QUALITY  auto / 1080 / 720 / 360 (default "auto")
 #    ZS_SUB      in_id / ms / en / none (default "in_id")
+#    ZS_SOURCE  moviebox (default) / lk21 / manual / hianime (Task 104b:
+#                anime hianime-dl.halahgan.com — link halaman download di
+#                ZS_LINK; URL file ter-sign 6 jam → auto-refresh+resume;
+#                bulk via ZS_EPISODES 'all'/'1-100'; musim token = ZS_SE)
 #    ZS_TOKEN    token register dari Admin → Server 3 (opsional; untuk bulk
 #                kirim token SCOPE-SERIES — dibuat tanpa episode, register
 #                mengirim "episode" per panggilan)
@@ -113,7 +117,7 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
 
 if SUB_LANG in ("none", "no", "off", "tanpa", "-"):
     SUB_LANG = ""
-if SOURCE not in ("moviebox", "lk21", "manual"):
+if SOURCE not in ("moviebox", "lk21", "manual", "hianime"):
     SOURCE = "moviebox"
 if TIPE not in ("movie", "tv"):
     TIPE = ""
@@ -745,31 +749,71 @@ def abyss_upload(file_path, log=lambda s: None):
     return None
 
 
-def register_one(slug, ep, res, size, sub_text, sub_lan, is_tv, retries=4):
+def _register_curl(url, payload):
+    """POST register via curl + UA browser (Task 104b) — lolos tantangan
+    WAF Cloudflare di jaringan yang menolak urllib (teruji dari sandbox,
+    5 Nov 2026; pola identik notebook hianime). Return dict | None."""
+    if not shutil.which("curl"):
+        return None
+    try:
+        p = subprocess.run(
+            ["curl", "-sS", "-m", "120", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-H", f"User-Agent: {UA}",
+             "-H", "Referer: https://www.zeestream.biz.id/",
+             "-H", "Origin: https://www.zeestream.biz.id",
+             "--data", payload, url],
+            capture_output=True, timeout=150)
+        return json.loads(p.stdout or b"{}")
+    except Exception:
+        return None
+
+
+def register_one(slug, ep, res, size, sub_text, sub_lan, is_tv, retries=4,
+                  subs_list=None):
     """Register SATU episode ke katalog situs. Body membawa 'episode' —
     dipakai token scope-series; token per-episode mengabaikannya (aman).
-    Return dict jawaban situs; 'retry'=True → Abyss masih mem-proses."""
+    Return dict jawaban situs; 'retry'=True → Abyss masih mem-proses.
+    subs_list (Task 104b): daftar subtitle SIAP PAKAI (dict {lang,
+    filename, content, srt}) — utk sumber hianime (VTT, srt=False);
+    bila None dipakai jalur lama (sub_text SRT tunggal)."""
     if not TOKEN:
         return {"ok": True, "skip": "token-kosong"}
-    subs = []
-    if sub_text:
+    if subs_list is not None:
+        subs = subs_list
+    elif sub_text:
         subs = [{"lang": sub_lan or "Indonesia",
                  "filename": f"{lang_slug(sub_lan)}.srt",
                  "content": sub_text, "srt": True}]
+    else:
+        subs = []
     body = {"slug": slug, "subs": subs, "quality": f"{res}p", "size": size}
     if is_tv:
         body["episode"] = ep
-    req = urllib.request.Request(
-        f"{REGISTER}?token={urllib.parse.quote(TOKEN)}",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "zs-actions/1.0"})
+    payload = json.dumps(body)
+    url = f"{REGISTER}?token={urllib.parse.quote(TOKEN)}"
     reg = {}
     for attempt in range(retries):
+        reg = {}
         try:
+            req = urllib.request.Request(
+                url, data=payload.encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "zs-actions/1.0"})
             reg = json.load(urllib.request.urlopen(req, timeout=120))
         except Exception as e:
-            reg = {"ok": False, "error": repr(e)[:200]}
+            # jaringan menantang urllib (WAF 403 / HTML challenge) →
+            # jalur cadangan curl + UA browser; bila itu pun gagal,
+            # tunggu & coba lagi (register itu idempoten per token seri)
+            reg = _register_curl(url, payload) or {}
+            if not reg:
+                reg = {"ok": False,
+                       "error": f"tak terjangkau ({repr(e)[:80]})"}
+                if attempt + 1 < retries:
+                    say(f"  register diblokir jaringan — tunggu 20 dtk, "
+                        f"ulang ({attempt + 1}/{retries})…")
+                    time.sleep(20)
+                    continue
         if reg.get("ok") or not reg.get("retry"):
             return reg
         say(f"  Abyss masih mem-proses — tunggu 60 dtk, ulang register "
@@ -1971,6 +2015,793 @@ def main_manual():
     say("=" * 58)
 
 
+# ===================== SOURCE HIANIME-DL (Task 104b) =====================
+# Anime dari hianime-dl.halahgan.com — alur sama seperti sumber lain:
+# unduh → upload Abyss → register katalog Server 3 (+ subtitle VTT).
+# Keunikan sumber (semua terverifikasi empiris, 5 Nov 2026):
+#   - URL file TER-SIGN per akses: /file/...?iat&exp&sig dengan
+#     exp-iat = 21600 dtk (tepat 6 jam) → mesin selalu MINT link segar
+#     dari halaman /download/ tepat sebelum dipakai; bila 403 (kadaluarsa)
+#     → mint ulang → lanjut RESUME via Range (unduh tak pernah dari nol).
+#   - Daftar episode ADA DI HALAMAN (section "Episode lain", 50/halaman;
+#     paginasi ?page=N diikuti sampai habis). Nomor = ABSOLUT (Black
+#     Clover: 1-170 tanpa 162 — slot hilang TIDAK menggeser nomor lain).
+#   - Kualitas terikat DI URL (/1080p/ dst; tak semua judul punya semua
+#     kualitas — 404) → input 'kualitas' DIABAIKAN utk sumber ini.
+#   - Subtitle VTT per bahasa (id/en/arabic/french/german/italian/
+#     russian/spanish×2/portuguese — 10 bahasa), URL ter-sign sendiri.
+# Peta absolut→(musim,episode) otomatis via proxy TMDB situs (tanpa API
+# key); token register = scope-series PER MUSIM → input 'musim' =
+# musim token itu. Episode yang terpetakan ke musim lain DILEWATI dengan
+# pesan (jalankan run terpisah dengan token musim tersebut).
+# Bila situs sumber menomori PER MUSIM (ep list selalu mulai Ep_0001)
+# terdeteksi otomatis → peta datar abs n = S{musim}En.
+# =========================================================================
+import html as _hi_html
+
+HI_BASE = "https://hianime-dl.halahgan.com"
+HI_SITE_TMDB = "https://www.zeestream.biz.id/api/tmdb"
+HI_STALL_S = 120          # dtk tanpa byte masuk → putus → mint ulang → resume
+HI_CHUNK = 1 << 20
+HI_DIR = "hi_dl"          # file episode + state (subdir — aman dari
+#                          cleanup_workspace yang hanya meng-glob root CWD)
+
+_HI_LANG_NICE = {
+    "id": "Indonesia", "en": "English", "ms": "Melayu", "arabic": "Arabic",
+    "french": "French", "german": "German", "italian": "Italian",
+    "russian": "Russian", "spanish_spanish_esp": "Spanish (ES)",
+    "spanish_spanish_lat": "Spanish (LATAM)",
+    "portuguese_portuguese_brazilian": "Portuguese (BR)",
+}
+_HI_SUB_MAP = {"in_id": "id", "id": "id", "ms": "ms", "en": "en",
+               "arabic": "arabic", "fr": "french", "french": "french",
+               "de": "german", "german": "german", "it": "italian",
+               "italian": "italian", "ru": "russian", "russian": "russian",
+               "es": "spanish_spanish_esp", "pt": "portuguese_portuguese_brazilian"}
+
+
+def hi_http(url, referer=None, timeout=45, hdrs=None):
+    """GET dasar dengan UA browser (situs menolak klien polos)."""
+    h = {"User-Agent": UA, "Accept": "*/*",
+         "Accept-Language": "en-US,en;q=0.9,id;q=0.8"}
+    if referer:
+        h["Referer"] = referer
+    if hdrs:
+        h.update(hdrs)
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=h), timeout=timeout)
+
+
+def hi_parse(html_text, page_url=""):
+    """Bedah halaman /download/ → info file + URL ter-sign + episode."""
+    signed = []
+    for m in re.finditer(r'href="(/file/[^"]+)"', html_text):
+        u = _hi_html.unescape(m.group(1))
+        if u not in signed:
+            signed.append(u)
+
+    video_url, subs = None, {}
+    for u in signed:
+        q = u.split("?", 1)[0]
+        if q.endswith(".mp4"):
+            if video_url is None:
+                video_url = u
+        elif q.endswith(".vtt"):
+            code = q.rsplit(".", 2)[-2]          # nama.id.vtt → "id"
+            subs[code] = u
+
+    def _id(el):
+        m = re.search(r'id="%s"[^>]*>([^<]*)<' % el, html_text)
+        return (m.group(1).strip() if m else "")
+
+    m = re.search(r'data-expires="(\d+)"', html_text)
+    expires = int(m.group(1)) if m else 0
+
+    eps, seen = [], set()
+    for m in re.finditer(
+            r'href="(https?://[^"]+?/download/[^"]+?/Ep_(\d+)/[^"]+?\.mp4)"',
+            html_text):
+        u, n = _hi_html.unescape(m.group(1)), int(m.group(2))
+        if n not in seen:
+            seen.add(n)
+            eps.append({"n": n, "url": u.split("?")[0]})
+
+    m = re.search(r"Halaman (\d+) dari (\d+)", html_text)
+    pages = int(m.group(2)) if m else 1
+
+    return {
+        "page_url": page_url,
+        "title": _id("episode-heading") or _id("file-name"),
+        "filename": _id("file-name"),
+        "quality": _id("file-quality"),
+        "size_text": _id("file-size"),
+        "expires": expires,
+        "video": (HI_BASE + video_url) if video_url else None,
+        "subs": {k: HI_BASE + v for k, v in subs.items()},
+        "episodes": eps,          # episode di halaman INI saja
+        "pages": pages,
+    }
+
+
+def hi_page(page_url):
+    r = hi_http(page_url, referer=HI_BASE + "/")
+    return hi_parse(r.read().decode("utf-8", "replace"), page_url)
+
+
+def hi_mint(page_url):
+    """MINT: panen URL file+subtitle SEGAR dari halaman (berlaku 6 jam)."""
+    return hi_page(page_url)
+
+
+def hi_episodes_all(page_url):
+    """Seluruh episode series (ikuti paginasi 50/halaman) → (list, info_p1).
+    Film tanpa daftar episode → hanya dirinya sendiri."""
+    p1 = hi_page(page_url)
+    all_eps = {e["n"]: e for e in p1["episodes"]}
+    cur = page_url.split("?")[0]
+    m = re.search(r"/Ep_(\d+)/", cur)
+    if m and int(m.group(1)) not in all_eps:
+        all_eps[int(m.group(1))] = {"n": int(m.group(1)), "url": cur}
+    for pg in range(2, p1["pages"] + 1):
+        try:
+            pp = hi_page(cur + f"?page={pg}")
+        except Exception as e:
+            say(f"  ! halaman daftar-episode {pg} gagal ({e!r:.60}) — lewati")
+            continue
+        for e in pp["episodes"]:
+            all_eps.setdefault(e["n"], e)
+    return [all_eps[k] for k in sorted(all_eps)], p1
+
+
+def hi_size_bytes(text):
+    """'232.31 MiB' / '1.2 GiB' → bytes (None bila tak terbaca)."""
+    m = re.search(r"([\d.]+)\s*([KMGT]?I?B)", str(text or "").strip(), re.I)
+    if not m:
+        return None
+    u = m.group(2).upper()          # 'MiB' → 'MIB', 'MB' → 'MB'
+    mult = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+            "KIB": 1024, "MIB": 1024 ** 2, "GIB": 1024 ** 3,
+            "TIB": 1024 ** 4}
+    return int(float(m.group(1)) * mult.get(u, 1e6))
+
+
+def hi_download(page_url, out_path, max_refresh=12):
+    """Unduh MP4 resume + AUTO-REFRESH kadaluarsa (403 → mint → resume).
+    Return (ok, pesan). Aman diulang — file setengah jadi disambung."""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    total = None
+    for attempt in range(1, max_refresh + 1):
+        try:
+            mint = hi_mint(page_url)
+        except Exception as e:
+            say(f"  [mint {attempt}] gagal: {e!r:.90}")
+            time.sleep(3 * attempt)
+            continue
+        url = mint["video"]
+        if not url:
+            return False, "halaman tanpa link file (struktur berubah?)"
+        pos = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+        if total and pos >= total:
+            return True, "sudah lengkap"
+        hdrs = {"Range": f"bytes={pos}-"} if pos else {}
+        try:
+            r = hi_http(url, referer=page_url, timeout=75, hdrs=hdrs)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 410):          # ← KADALUARSA → mint ulang
+                say(f"  [refresh {attempt}] link kadaluarsa (403) → "
+                    "ambil link baru…")
+                time.sleep(2)
+                continue
+            if e.code == 404:
+                return False, "file tidak ada (404) di server sumber"
+            say(f"  [coba {attempt}] HTTP {e.code} → ulang…")
+            time.sleep(3 * attempt)
+            continue
+        except Exception as e:
+            say(f"  [coba {attempt}] jaringan: {e!r:.90}")
+            time.sleep(3 * attempt)
+            continue
+
+        code = getattr(r, "status", None) or r.getcode()
+        cr = r.headers.get("Content-Range") or ""
+        m = re.search(r"/(\d+)$", cr)
+        if m:
+            total = int(m.group(1))
+        elif code == 200:
+            total = pos + int(r.headers.get("Content-Length") or 0)
+        mode = "ab" if (pos and code == 206) else "wb"
+        if pos and code != 206:
+            pos = 0
+        if total and pos >= total:
+            return True, "sudah lengkap"
+
+        mark, last_t, last_sz, done = -1, time.time(), pos, pos
+        try:
+            with open(out_path, mode) as f:
+                while True:
+                    chunk = r.read(HI_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if done >> 22 != mark:              # tiap ±4 MB
+                        mark = done >> 22
+                        pct = f" ({done*100//total}%)" if total else ""
+                        say(f"    {done/1e6:.0f} MB{pct}")
+                    if done > last_sz:
+                        last_sz, last_t = done, time.time()
+                    elif time.time() - last_t > HI_STALL_S:
+                        raise TimeoutError(f"stall — tanpa data "
+                                           f"{int(time.time()-last_t)} dtk")
+        except TimeoutError as e:
+            say(f"  [stall] {e} → link baru, resume…")
+            continue
+        except Exception as e:
+            say(f"  [putus] di {done/1e6:.0f} MB ({e!r:.80}) → "
+                "link baru, resume…")
+            continue
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
+        if total and done >= total:
+            return True, f"lengkap {done/1e6:.0f} MB"
+        say(f"  [lanjut] {done/1e6:.0f}/{(total or 0)/1e6:.0f} MB → "
+            "sambung…")
+    return False, (f"gagal setelah {max_refresh}× refresh "
+                   f"(tercapai {os.path.getsize(out_path)/1e6:.0f}/"
+                   f"{(total or 0)/1e6:.0f} MB)")
+
+
+def _hi_vtt_fallback(mint):
+    """Subtitle utama tak ada → coba en → ms → arabic (jangan kosong)."""
+    for code in ("en", "ms", "arabic"):
+        u = mint["subs"].get(code)
+        if u:
+            say(f"  (subtitle pilihan tidak ada — pakai '{code}')")
+            try:
+                r = hi_http(u, referer=mint["page_url"], timeout=60)
+                t = r.read().decode("utf-8", "replace")
+                if "-->" in t:
+                    return code, t
+            except Exception:
+                pass
+    return None, None
+
+
+def hi_vtt(page_url, lang="id", max_refresh=6):
+    """Isi subtitle VTT (teks) — mint segar otomatis bila 403.
+    Return (code, teks) atau (None, None)."""
+    for attempt in range(1, max_refresh + 1):
+        try:
+            mint = hi_mint(page_url)
+            url = mint["subs"].get(lang)
+        except Exception as e:
+            say(f"  [vtt mint {attempt}] {e!r:.80}")
+            time.sleep(2 * attempt)
+            continue
+        if not url:
+            avail = ", ".join(sorted(mint["subs"])) or "-"
+            if lang != "id":
+                return None, None
+            say(f"  subtitle '{lang}' tidak ada (tersedia: {avail})")
+            return _hi_vtt_fallback(mint)
+        try:
+            r = hi_http(url, referer=page_url, timeout=60)
+            text = r.read().decode("utf-8", "replace")
+            if "-->" in text:
+                return lang, text
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 410):
+                say(f"  [vtt refresh {attempt}] 403 → link baru…")
+                time.sleep(2)
+                continue
+        except Exception as e:
+            say(f"  [vtt {attempt}] {e!r:.80}")
+            time.sleep(2 * attempt)
+    return None, None
+
+
+def hi_lang_nice(code):
+    return _HI_LANG_NICE.get(code, str(code).capitalize())
+
+
+def hi_tmdb_get(url):
+    """GET proxy TMDB situs — 2 jalur: urllib → curl (fingerprint curl
+    lebih sering lolos WAF). Return dict | None."""
+    hdrs = {"User-Agent": UA,
+            "Referer": "https://www.zeestream.biz.id/"}
+    try:
+        req = urllib.request.Request(url, headers=hdrs)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read() or b"{}")
+    except Exception:
+        pass
+    if shutil.which("curl"):
+        try:
+            p = subprocess.run(
+                ["curl", "-sS", "-m", "30", "-A", UA,
+                 "-H", "Referer: " + hdrs["Referer"], url],
+                capture_output=True, timeout=45)
+            return json.loads(p.stdout or b"{}")
+        except Exception:
+            return None
+    return None
+
+
+def hi_tmdb_season_map(query, pick=0):
+    """Cari seri di TMDB (via proxy situs) → peta absolut→(musim,episode),
+    mengikuti urutan episode TMDB musim demi musim. Return (smap, info)."""
+    j = hi_tmdb_get(HI_SITE_TMDB + "/search/tv?query="
+                    + urllib.parse.quote(query))
+    rows = (j or {}).get("results") or []
+    if not rows:
+        return {}, "TMDB tak terjangkau / tanpa hasil"
+    idx = min(max(pick or 0, 0), len(rows) - 1)
+    hit = rows[idx]
+    tid, name = hit.get("id"), (hit.get("name")
+                                or hit.get("original_name") or "?")
+    smap, k = {}, 1
+    for s in range(1, 41):
+        sj = hi_tmdb_get(f"{HI_SITE_TMDB}/tv/{tid}/season/{s}")
+        eps = (sj or {}).get("episodes") or []
+        if not eps:
+            break
+        for e in range(1, len(eps) + 1):
+            smap[k] = (s, e)
+            k += 1
+        time.sleep(0.4)
+    if not smap:
+        return {}, f"TMDB {name} (id {tid}) tanpa data musim"
+    return smap, (f"TMDB {name} (id {tid}) — {len(smap)} episode "
+                  f"terpetakan absolut")
+
+
+def hi_parse_eps_spec(spec, available):
+    """'all' | '1-51' | '1,3,5-8' | '52-' → nomor absolut yang tersedia."""
+    avail = sorted(available)
+    if not spec or str(spec).strip().lower() in ("all", "semua"):
+        return avail
+    out = []
+    for part in str(spec).replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            a = int(a or 1)
+            b = int(b) if b else (avail[-1] if avail else 0)
+            out += list(range(a, b + 1))
+        else:
+            out.append(int(part))
+    return sorted(set(n for n in out if n in available))
+
+
+def hi_wait_ready(slug, max_minutes=15):
+    """Tunggu transcode Abyss sampai 'ready' (pola run_moviebox).
+    Dua jalur: urllib → curl+UA browser (api.abyss.to menolak klien
+    polos 403 di sebagian jaringan — terukur dari sandbox 5 Nov)."""
+    t0 = time.time()
+    while time.time() - t0 < max_minutes * 60:
+        fi = {}
+        try:
+            fi = json.load(urllib.request.urlopen(
+                f"https://api.abyss.to/v1/files/{slug}?key={ABYSS_KEY}",
+                timeout=60))
+        except Exception:
+            fi = {}
+            if shutil.which("curl"):
+                try:
+                    p = subprocess.run(
+                        ["curl", "-sS", "-m", "45", "-A", UA,
+                         f"https://api.abyss.to/v1/files/{slug}"
+                         f"?key={ABYSS_KEY}"],
+                        capture_output=True, timeout=60)
+                    fi = json.loads(p.stdout or b"{}")
+                except Exception:
+                    fi = {}
+        if fi.get("status") == "ready":
+            return True
+        if fi.get("status") in ("error", "failed"):
+            return False
+        if int(time.time() - t0) % 60 < 3:
+            say(f"  transcode: {fi.get('status') or '?'}… "
+                f"({int(time.time()-t0)//60} mnt)")
+        time.sleep(20)
+    return False
+
+
+def hi_series_key(link):
+    """Kunci state per seri: segmen judul di URL (/download/Hi/{Judul}/)."""
+    m = re.search(r"/download/[^/]+/([^/]+)/", link or "")
+    key = (m.group(1) if m else "series").strip("/ ")
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", key) or "series"
+
+
+def main_hianime():
+    """Alur sumber HIANIME-DL (Task 104b): tempel 1 URL halaman download
+    (episode apa pun dari seri tsb, kualitas ikut URL) → pipeline:
+    enumerate episode (paginasi) → peta musim TMDB → per episode:
+    unduh (auto-refresh 6 jam) → subtitle VTT → upload Abyss → register
+    (token scope-series musim input 'musim'). Bulk di-chunk otomatis."""
+    say("ZS pipeline — SUMBER HIANIME-DL (hianime-dl.halahgan.com)")
+    summary_line(f"# ZS Download (Hianime) — {TITLE or '(dari URL)'}")
+    if not LINK:
+        fail("Input 'link' kosong — tempel URL halaman download hianime-dl, "
+             "mis. https://hianime-dl.halahgan.com/download/Hi/Black_Clover/"
+             "Ep_0001/1080p/Black_Clover_Ep_0001_1080p.mp4")
+    if not re.search(r"^https?://hianime-dl\.halahgan\.com/download/", LINK):
+        fail("Link bukan halaman download hianime-dl (harus berawalan "
+             "https://hianime-dl.halahgan.com/download/…).")
+    if not ABYSS_KEY:
+        fail("Secret ABYSS_KEY belum diset di repo.")
+    page_url = LINK.split("?")[0]
+
+    # ---- probe + enumerasi ----
+    say("\nProbe halaman sumber…")
+    try:
+        p1 = hi_page(page_url)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            fail("Halaman 404 — kemungkinan kualitas di URL tak tersedia "
+                 "untuk judul ini (coba ganti /1080p/ ↔ /720p/).")
+        fail(f"Halaman sumber tak terjangkau: HTTP {e.code}")
+    left = max(0, p1["expires"] - int(time.time()))
+    say(f"✔ {p1['title']} — {p1['quality']} · {p1['size_text']}")
+    say(f"  Subtitle tersedia: {', '.join(sorted(p1['subs'])) or '-'}")
+    say(f"  Link ter-sign segar berlaku ±{left//3600} jam {left%3600//60} "
+        "menit (auto-refresh bila kadaluarsa)")
+    summary_line(f"- Sumber: hianime-dl — **{p1['title']}** "
+                 f"({p1['quality']})")
+    if QUALITY not in ("auto", "", p1.get("quality", "").rstrip("p")):
+        say(f"  (catatan: input kualitas '{QUALITY}' diabaikan — kualitas "
+            f"terikat URL sumber: {p1['quality']})")
+
+    quality = p1.get("quality") or ""
+    m = re.search(r"(\d{3,4})", quality)
+    res = int(m.group(1)) if m else 1080
+
+    say("\nBaca daftar episode (paginasi)…")
+    eps_all, _ = hi_episodes_all(page_url)
+    is_tv = len(eps_all) > 1 if not TIPE else (TIPE == "tv")
+    say(f"Total episode terdeteksi: {len(eps_all)}"
+        + (f" (Ep {eps_all[0]['n']:04d}–{eps_all[-1]['n']:04d})"
+           if eps_all else ""))
+    if not eps_all:
+        eps_all = [{"n": EPISODE or 1, "url": page_url}]
+    epmap = {e["n"]: e["url"] for e in eps_all}
+    avail = sorted(epmap)
+
+    # ---- episode yang diminta ----
+    spec = EPISODES_SPEC or ""
+    if not spec and not EPISODES_SPEC and EPISODE and EPISODE > 1:
+        spec = str(EPISODE)
+    want = hi_parse_eps_spec(spec, avail)
+    if not want:
+        fail("Tidak ada episode yang diminta terdapat di daftar sumber "
+             f"(tersedia: {build_episode_spec(avail) or '1'})")
+    judul = (TITLE or re.sub(r"_", " ", hi_series_key(page_url))).strip()
+
+    # ---- peta absolut → (musim, episode) ----
+    smap, map_info = {}, ""
+    if is_tv:
+        say(f"\nPeta musim otomatis: cari '{judul}' di TMDB "
+            f"(pilihan #{PICK})…")
+        smap, map_info = hi_tmdb_season_map(judul, PICK)
+        say(f"  {map_info}")
+        if smap:
+            mapped = {smap[n][0] for n in want if n in smap}
+            if SEASON not in mapped and mapped:
+                say(f"  ⚠ Tak ada episode terpetakan ke musim {SEASON} "
+                    f"(terpetakan: musim {sorted(mapped)}) — kemungkinan "
+                    "sumber menomori PER MUSIM → peta datar: "
+                    f"abs n = S{SEASON}En.")
+                smap = {}
+        if not smap:
+            say(f"  fallback peta datar: abs n = S{SEASON}En "
+                "(serial multi-musim dengan penomoran absolut? isi "
+                "'pilihan' bila TMDB salah ambil, atau periksa judul).")
+
+    plan = []
+    for n in want:
+        if not is_tv:
+            plan.append({"abs": n, "se": None, "ep": None})
+        elif smap and n in smap:
+            s, e = smap[n]
+            plan.append({"abs": n, "se": s, "ep": e})
+        elif smap:
+            plan.append({"abs": n, "se": None, "ep": None})  # di luar TMDB
+        else:
+            plan.append({"abs": n, "se": SEASON, "ep": n})
+
+    say(f"\nRencana: {len(plan)} episode · kualitas {quality} · "
+        f"tipe {'SERIES' if is_tv else 'FILM'}")
+    if is_tv:
+        no_map = [p for p in plan if p["se"] is None]
+        lain = [p for p in plan if p["se"] not in (None, SEASON)]
+        if no_map:
+            say(f"⚠ {len(no_map)} episode di LUAR rentang TMDB → "
+                "dilewati (tak bisa register).")
+        if lain:
+            musim_lain = sorted({p['se'] for p in lain})
+            say(f"⚠ {len(lain)} episode milik musim LAIN "
+                f"({musim_lain}) → didownload+upload, register DILEWATI "
+                "tanpa token musimnya (jalankan run terpisah dengan "
+                "token musim itu + episodes yang sama bila perlu).")
+    show = plan[:6] + (["…"] + plan[-6:] if len(plan) > 12 else [])
+    for p in show:
+        if p == "…":
+            say("  …")
+            continue
+        tag = (f"S{p['se']}E{p['ep']}" if p["se"] is not None
+               else ("abs" + str(p["abs"]) if is_tv else "FILM"))
+        say(f"  abs {p['abs']:>4} → {tag}")
+    summary_line(f"- Rencana: {len(plan)} episode ({quality}, "
+                 f"{'series' if is_tv else 'film'})")
+
+    if os.environ.get("ZS_DRY"):
+        say("\nZS_DRY aktif — berhenti setelah rencana (tanpa unduh).")
+        return
+
+    # ---- state (resumable antar-run & antar-chunk) ----
+    os.makedirs(HI_DIR, exist_ok=True)
+    state_f = os.path.join(HI_DIR, f"state-{hi_series_key(page_url)}.json")
+    state = {}
+    if os.path.exists(state_f):
+        try:
+            state = json.load(open(state_f, encoding="utf-8"))
+            n_reg = sum(1 for v in state.values() if v.get("registered"))
+            say(f"\nState lama dimuat: {n_reg} episode sudah terdaftar "
+                "→ dilewati.")
+        except Exception:
+            state = {}
+
+    # slug lama (input slug_lama): "1=MxCWqhgPq,2=AbCd1234" — daftar ulang
+    # tanpa unduh+upload ulang (mode register-saja per episode).
+    if REUSE_SLUG:
+        pairs = 0
+        for part in REUSE_SLUG.replace(";", ",").split(","):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                k = k.strip()
+                if k.isdigit() and v.strip():
+                    ab = str(int(k))
+                    if ab not in state:
+                        state[ab] = {"slug": v.strip()}
+                        pairs += 1
+        if pairs:
+            say(f"Slug lama dipakai ulang: {pairs} episode "
+                "(unduh+upload dilewati).")
+            json.dump(state, open(state_f, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+
+    # ---- bersihkan sisa file seri LAIN (disk Codespace persisten) ----
+    prefix = hi_series_key(page_url) + "_Ep_"
+    freed = 0
+    for f in glob.glob(os.path.join(HI_DIR, "*.mp4")):
+        if os.path.basename(f).startswith(prefix):
+            continue                      # file seri ini = target (resume)
+        try:
+            freed += os.path.getsize(f)
+            os.remove(f)
+        except OSError:
+            pass
+    if freed:
+        say(f"🧹 bersihkan sisa seri lain: {freed/1e6:.0f} MB")
+
+    # ---- subtitle: kode bahasa dari input (in_id→id; boleh list) ----
+    sub_codes = []
+    for tok in re.split(r"[, ]+", SUB_LANG):
+        c = _HI_SUB_MAP.get(tok.strip().lower())
+        if c and c not in sub_codes:
+            sub_codes.append(c)
+    sub_codes = sub_codes[:3]
+
+    # ---- eksekusi per episode ----
+    t0 = time.time()
+    results, rem = [], None
+    for i, p in enumerate(plan):
+        ab, se, ep = p["abs"], p["se"], p["ep"]
+        st = state.get(str(ab)) or {}
+        tag = (f"S{se}E{ep}" if se is not None
+               else (f"abs{ab}" if is_tv else "FILM"))
+        if is_tv and se is None:
+            results.append({"abs": ab, "tag": tag, "ok": False,
+                            "error": "di luar peta TMDB"})
+            continue
+        if is_tv and se != SEASON:
+            # musim lain: dilewati TOTAL (unduh pun tak berguna tanpa
+            # token register musimnya — hemat bandwidth & kuota).
+            results.append({"abs": ab, "tag": tag, "ok": None,
+                            "error": f"musim {se} (bukan musim token "
+                                     f"{SEASON})"})
+            continue
+        if st.get("registered"):
+            say(f"[{i+1}/{len(plan)}] {tag} — sudah terdaftar "
+                f"(slug {st.get('slug')}), lewati")
+            results.append({"abs": ab, "tag": tag, "ok": True,
+                            "reg_ok": True, "slug": st.get("slug"),
+                            "skip": True})
+            continue
+        if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
+            rem = [x["abs"] for x in plan[i:]]
+            say(f"\n⏸ Budget chunk tercapai ({BUDGET_MIN} mnt) — "
+                f"{len(rem)} episode ditunda ke chunk berikutnya.")
+            break
+
+        say(f"\n=== [{i+1}/{len(plan)}] {tag} — abs {ab} ===")
+        url = epmap[ab]
+        fname = os.path.basename(urllib.parse.unquote(url))
+        fpath = os.path.join(HI_DIR, fname)
+        r = {"abs": ab, "tag": tag}
+
+        # 1) unduh (dilewati bila slug sudah ada dari run/chunk lalu)
+        if not st.get("slug"):
+            need = hi_size_bytes(p1["size_text"]) or 0
+            free = shutil.disk_usage(".").free
+            if need and need * 1.15 > free:
+                r.update(ok=False, error=f"disk kurang (butuh "
+                                         f"{need*1.15/1e9:.1f} GB, sisa "
+                                         f"{free/1e9:.1f} GB)")
+                results.append(r)
+                continue
+            ok, msg = hi_download(url, fpath)
+            if not ok:
+                r.update(ok=False, error=f"unduh gagal: {msg}")
+                results.append(r)
+                continue
+        else:
+            say(f"  unduh+upload dilewati (slug lama: {st['slug']})")
+            fpath = None
+
+        # 2) subtitle VTT (register + CC native)
+        subs_list = []
+        for code in sub_codes:
+            got_code, txt = hi_vtt(url, code)
+            if txt:
+                subs_list.append({"lang": hi_lang_nice(got_code),
+                                  "filename": f"{got_code}.vtt",
+                                  "content": txt, "srt": False})
+            if len(subs_list) >= 3:
+                break
+        say(f"  subtitle: {', '.join(s['lang'] for s in subs_list) or '-'}")
+
+        # 3) upload Abyss (rotasi endpoint Task 96c + pemulihan katalog)
+        slug = st.get("slug")
+        size = (os.path.getsize(fpath) if fpath and os.path.exists(fpath)
+                else st.get("size"))
+        if not slug:
+            say(f"  upload ke Abyss ({(size or 0)/1e6:.0f} MB)…")
+            up = abyss_upload(fpath, log=say)
+            if not (isinstance(up, dict) and up.get("status")):
+                r.update(ok=False, error="upload Abyss ditolak")
+                results.append(r)
+                continue
+            slug = up["slug"]
+            size = size or os.path.getsize(fpath)
+            say(f"  slug Abyss: {slug}")
+        size = size or st.get("size") or 0
+
+        # 4) bebaskan disk SEGERA (file aman di Abyss — pola v1.2.1)
+        if fpath and os.path.exists(fpath):
+            try:
+                os.remove(fpath)
+                say("  🧹 file lokal dihapus")
+            except OSError:
+                pass
+
+        state[str(ab)] = {"slug": slug, "size": size, "quality": quality}
+        json.dump(state, open(state_f, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+
+        # 5) tunggu transcode ready (register menolak file "waiting")
+        if not hi_wait_ready(slug):
+            say("  ⚠ transcode belum ready — register dicoba juga "
+                "(server meretry bila masih diproses)")
+
+        # 6) register ke katalog Server 3
+        reg = register_one(slug, ep, res, size, None, None, is_tv,
+                           retries=3, subs_list=subs_list or None)
+        r.update(ok=True, slug=slug, size=size)
+        if reg.get("skip"):
+            r["reg_ok"] = None
+        elif reg.get("ok"):
+            r["reg_ok"] = True
+        elif reg.get("retry"):
+            r["reg_pending"] = True
+        else:
+            r["reg_ok"] = False
+            r["reg_error"] = str(reg.get("error"))[:160]
+            say(f"  register gagal: {r['reg_error']}")
+            if "token" in r["reg_error"].lower():
+                say("  → buat token BARU (Admin → Server 3, scope-series "
+                    f"musim {SEASON}), jalankan ulang — upload TIDAK "
+                    "diulang (state).")
+        if reg.get("ok"):
+            state[str(ab)]["registered"] = True
+            state[str(ab)]["at"] = time.strftime("%Y-%m-%d %H:%M")
+            json.dump(state, open(state_f, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+            say(f"  ✔ TERDAFTARA di Server 3 ({tag})")
+
+        # 7) CC native player Abyss (best-effort, login sekali per batch)
+        if subs_list and ABYSS_EMAIL and ABYSS_PASSWORD:
+            global ABYSS_JWT
+            try:
+                if ABYSS_JWT is None:
+                    ABYSS_JWT = abyss_login(ABYSS_EMAIL, ABYSS_PASSWORD)
+                if ABYSS_JWT:
+                    s0 = subs_list[0]
+                    code = abyss_put_subtitle(
+                        ABYSS_JWT, slug, s0["lang"],
+                        f"{lang_slug(s0['lang'])}.vtt",
+                        srt_to_vtt(s0["content"]))
+                    r["sub_player_ok"] = code == 200
+            except Exception as e:
+                say("  CC player Abyss dilewati:", repr(e)[:90])
+        results.append(r)
+        time.sleep(2)
+
+    # ---- ronde ulang register yang masih "diproses Abyss" ----
+    for r in [x for x in results if x.get("reg_pending")]:
+        ab = r["abs"]
+        st = state.get(str(ab)) or {}
+        reg = register_one(st.get("slug"), plan_abs_ep(plan, ab), res,
+                           st.get("size"), None, None, is_tv, retries=3,
+                           subs_list=None)
+        r["reg_ok"] = bool(reg.get("ok"))
+        r.pop("reg_pending", None)
+        if reg.get("ok"):
+            st["registered"] = True
+            state[str(ab)] = st
+            json.dump(state, open(state_f, "w", encoding="utf-8"),
+                      ensure_ascii=False, indent=1)
+        say(f"  register ulang {r['tag']}: "
+            + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+
+    # ---- ringkasan ----
+    ok_n = sum(1 for x in results if x.get("ok") is True)
+    reg_n = sum(1 for x in results if x.get("reg_ok"))
+    skip_n = sum(1 for x in results if x.get("skip"))
+    musim_lain = [x for x in results if x.get("ok") is None]
+    fail_abs = [x["abs"] for x in results if x.get("ok") is False]
+    say("\n" + "=" * 58)
+    say(f"HIANIME: {ok_n} episode terupload, {reg_n} terdaftar, "
+        f"{skip_n} dilewati (sudah ada), {len(fail_abs)} gagal"
+        + (f", {len(musim_lain)} milik musim lain (dilewati)"
+           if musim_lain else ""))
+    for x in results:
+        if x.get("ok") is True and not x.get("skip"):
+            note = ""
+            if x.get("reg_ok") is False:
+                note = "  [register TERTUNDA — token?]"
+            say(f"  {x['tag']}: OK slug={x.get('slug')} {quality}"
+                + note)
+        elif x.get("ok") is False:
+            say(f"  {x['tag']}: GAGAL — {str(x.get('error'))[:110]}")
+    summary_line(f"- Hasil: {ok_n} upload · {reg_n} register · "
+                 f"{len(fail_abs)} gagal")
+    if fail_abs:
+        say(f"Episode gagal: {build_episode_spec(fail_abs)} — jalankan "
+            "ulang (episode sukses otomatis dilewati).")
+    if rem:
+        spec = build_episode_spec(rem)
+        say(f"\nSISA {len(rem)} episode → chunk berikutnya otomatis.")
+        say(f"ZS_BULK_REMAIN:{spec}")
+        summary_line(f"- Chunk berikutnya (otomatis): episodes `{spec}`")
+    say("=" * 58)
+    if results and ok_n == 0 and not rem and not musim_lain:
+        sys.exit(1)
+
+
+def plan_abs_ep(plan, ab):
+    for p in plan:
+        if p["abs"] == ab:
+            return p["ep"]
+    return None
+
+
 def mb_rank(results, query):
     """Task 96d: skor relevansi hasil MovieBox vs query — pick [0] tidak
     boleh asal (mis. 'Agent Kim Reactivated' pernah cocok ke 'The Legend
@@ -2403,6 +3234,10 @@ def abyss_put_subtitle(jwt, slug, language, filename, vtt_text):
 
 
 def main():
+    if SOURCE == "hianime":
+        # hianime: judul boleh kosong (turunan URL); slug_lama boleh
+        # berpasangan dgn episodes (mode register-saja per episode)
+        return main_hianime()
     if not TITLE:
         fail("Input 'judul' kosong — isi kata kunci pencarian.")
     if not ABYSS_KEY:
