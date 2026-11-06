@@ -702,6 +702,21 @@ def abyss_upload(file_path, log=lambda s: None):
     except Exception:
         pass
     base = os.path.basename(file_path)
+    # [v1.2.4] Koma/titik-koma di nama file MEMATAHKAN curl -F (exit 26,
+    # 0 byte terkirim, instan di semua endpoint): koma = pemisah
+    # multi-file, ";" = pemisah parameter form. Kasus nyata 6 Nov 2026:
+    # "One Year to Live, Buy a Man (2026) [1080p].mp4" (1,35 GB) gagal
+    # 2 run beruntun (0/1355 MB) padahal unduhan + integritas OK.
+    # Solusi: symlink nama aman + filename= eksplisit dalam kutip ganda;
+    # '"' di nama diganti "'" agar bentuk kutip tak pecah.
+    name_q = base.replace('"', "'")
+    up_file = "/tmp/zs-up-file.mp4"
+    try:
+        if os.path.lexists(up_file):
+            os.remove(up_file)
+        os.symlink(os.path.abspath(file_path), up_file)
+    except OSError:
+        up_file = file_path   # fallback: kutipan path tetap aman utk , dan ;
     pre = {it.get("slug") for it in abyss_list_items()}
     # jatah waktu per endpoint (mnt): utama longgar, fallback mengecil —
     # total terburuk ±2 jam utk memberi ruang rotasi dalam jendela run
@@ -711,7 +726,8 @@ def abyss_upload(file_path, log=lambda s: None):
         cmd = ["curl", "-sS", "-A", UA, "--max-time", str(max_time),
                "--speed-limit", "2048", "--speed-time", "300",
                "-o", resp, "-w", "%{size_upload} %{http_code}",
-               "-F", f"file=@{file_path};type=video/mp4",
+               "-F", f'file=@"{up_file}";filename="{name_q}";'
+                     "type=video/mp4",
                f"{ep}/{ABYSS_KEY}"]
         log(f"  upload via {ep} (jatah {max_time // 60} mnt)…")
         try:
@@ -737,7 +753,7 @@ def abyss_upload(file_path, log=lambda s: None):
                 for it in abyss_list_items():
                     isz = int(it.get("size") or 0)
                     if (it.get("slug") not in pre
-                            and it.get("name") == base
+                            and it.get("name") in (base, name_q)
                             and isz and abs(isz - size) / size < 0.05):
                         log(f"  PEMULIHAN OK: slug {it['slug']} "
                             "muncul di katalog")
