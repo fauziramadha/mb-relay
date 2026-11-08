@@ -50,6 +50,7 @@
 #   - register retry saat jawaban "still processing" (202).
 import base64
 import glob
+import hashlib
 import json
 import os
 import re
@@ -803,7 +804,8 @@ def register_one(slug, ep, res, size, sub_text, sub_lan, is_tv, retries=4,
                  "content": sub_text, "srt": True}]
     else:
         subs = []
-    body = {"slug": slug, "subs": subs, "quality": f"{res}p", "size": size}
+    body = {"slug": slug, "subs": subs,
+            "quality": (f"{res}p" if res else ""), "size": size}
     if is_tv:
         body["episode"] = ep
     payload = json.dumps(body)
@@ -936,6 +938,121 @@ def process_episode(domain, dp, se, ep, judul, tahun, is_tv):
     return r
 
 
+# =====================================================================
+#  [v1.2.5] STATE BULK SERIAL (moviebox & lk21) — resumable antar-run.
+#  Latar (7 Nov 2026, "The Lament of Autumn" 40 ep): codespace mati
+#  idle-timeout di tengah run (ep 24 selesai; proxy 401) → monitor
+#  Task 105 menjalankan ulang job dgn input ASLI (daftar episode PENUH)
+#  → jalur moviebox/lk21 TIDAK punya posisi → mengulang dari ep 1 dan
+#  menimpa log dgn unduhan ulang episode yang sudah aman di Abyss.
+#  hianime sudah punya state-file per seri — pola yang sama kini dipakai
+#  SEMUA sumber serial: episode yg sudah terdaftar → LEWATI; yg sudah
+#  terupload (slug ada) tapi register belum selesai → register-saja.
+# =====================================================================
+DL_STATE_DIR = "dl_state"
+
+
+def series_state_file(key):
+    os.makedirs(DL_STATE_DIR, exist_ok=True)
+    return os.path.join(DL_STATE_DIR, f"state-{key}.json")
+
+
+def series_state_key(judul, se, uniq):
+    """Kunci state per seri: judul + musim + hash8 identity unik
+    (detailPath utk moviebox / slug halaman utk lk21) — seri berbeda
+    yang berbagi judul tidak saling menimpa."""
+    h = hashlib.md5(str(uniq or "").encode("utf-8", "replace")).hexdigest()[:8]
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                  f"{judul}_S{se:02d}").strip("_")[:60]
+    return f"{base}-{h}"
+
+
+def series_state_load(state_f):
+    if os.path.exists(state_f):
+        try:
+            st = json.load(open(state_f, encoding="utf-8"))
+            if isinstance(st, dict):
+                return st
+        except Exception:
+            pass
+    return {}
+
+
+def series_state_save(state_f, state):
+    try:
+        json.dump(state, open(state_f, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def state_note(state):
+    """Baris ringkasan state utk log (atau string kosong)."""
+    n_reg = sum(1 for v in state.values() if v.get("registered"))
+    n_slug = sum(1 for v in state.values() if v.get("slug"))
+    if not state:
+        return ""
+    return (f"{n_reg} episode terdaftar, "
+            f"{max(n_slug - n_reg, 0)} upload-belum-register")
+
+
+def state_record(state, state_f, ep, r):
+    """Catat hasil SATU episode ke state + simpan SEGERA (crash-safe:
+    codespace bisa mati kapan pun; episode selesai = tersimpan)."""
+    if not (r.get("ok") and r.get("slug")):
+        return
+    ent = state.setdefault(str(ep), {})
+    ent.update(slug=r["slug"], size=r.get("size") or ent.get("size"),
+               quality=r.get("res") or ent.get("quality"))
+    if r.get("reg_ok"):
+        ent["registered"] = True
+        ent["at"] = time.strftime("%Y-%m-%d %H:%M")
+    series_state_save(state_f, state)
+
+
+def register_resume_mb(domain, dp, se, ep, st, is_tv):
+    """[v1.2.5] Episode moviebox yang SUDAH terupload (slug di state)
+    tapi register belum selesai (run mati / Abyss masih mem-proses /
+    token dulu kosong): register-saja TANPA unduh+upload ulang.
+    Subtitle resmi diambil lagi bila API masih terjangkau."""
+    slug = st.get("slug")
+    res = st.get("quality")
+    size = int(st.get("size") or 0)
+    say(f"  unduh+upload DILEWATI (slug dari state: {slug}) — register…")
+    sub_text, sub_lan = None, None
+    if SUB_LANG:
+        try:
+            pj = mb_play(domain, dp, se, ep)
+            streams = [s for s in ((pj.get("data") or {}).get("streams") or [])
+                       if not s.get("vipLocked")]
+            if streams:
+                stream = _choose_stream(streams, res or QUALITY)
+                caps = ((mb_caption(domain, dp, stream).get("data") or {})
+                        .get("captions") or [])
+                cap = mb_pick_caption(caps, prefer=[SUB_LANG])
+                if cap and cap.get("url"):
+                    raw = mb_http(cap["url"], timeout=90).read()
+                    sub_text = raw.decode("utf-8-sig", "replace")
+                    if "-->" not in sub_text:
+                        sub_text = None
+                    else:
+                        sub_lan = cap.get("lanName") or cap.get("lan")
+        except Exception as e:
+            say("  subtitle resume dilewati:", repr(e)[:90])
+    reg = register_one(slug, ep, res, size, sub_text, sub_lan, is_tv)
+    r = {"ep": ep, "ok": True, "slug": slug, "res": res, "size": size,
+         "reg_ok": bool(reg.get("ok")) and not reg.get("skip"),
+         "reg_skip": reg.get("skip"),
+         "reg_error": None if reg.get("ok") else str(reg.get("error"))[:160]}
+    if reg.get("retry"):
+        r["reg_pending"] = True
+        r["sub_text"] = sub_text
+    else:
+        say("  register:", "OK" if reg.get("ok")
+            else f"GAGAL — {str(reg.get('error'))[:120]}")
+    return r
+
+
 def run_bulk(domain, dp, sel, is_tv, eps):
     """Loop utama mode bulk: satu episode per iterasi dengan budget chunk.
     Marker ZS_BULK_REMAIN:<spec> dibaca runner utk antre chunk lanjutan."""
@@ -947,27 +1064,52 @@ def run_bulk(domain, dp, sel, is_tv, eps):
     summary_line(f"- Mode: **BULK** — {len(eps)} episode S{se} "
                  f"(chunk ±{BUDGET_MIN} menit)")
 
+    # [v1.2.5] state resumable — episode terdaftar → lewati; punya slug
+    # tapi belum register → register-saja (tanpa unduh ulang)
+    state_f = series_state_file(series_state_key(judul, se, dp))
+    state = series_state_load(state_f)
+    note = state_note(state)
+    if note:
+        say(f"State serial dimuat: {note} → tidak diunduh ulang.")
+        summary_line(f"- State serial: {note} (dilewati/register-saja)")
+
     results, remaining, t0 = [], [], time.time()
     for i, ep in enumerate(eps):
+        st = state.get(str(ep)) or {}
+        if st.get("registered"):
+            say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) — "
+                f"sudah terdaftar (slug {st.get('slug')}), LEWATI ===")
+            results.append({"ep": ep, "ok": True, "reg_ok": True,
+                            "slug": st.get("slug"), "skip": True})
+            continue
         if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
             remaining = eps[i:]
             say(f"\n⏸ Budget chunk tercapai ({BUDGET_MIN} mnt) — "
                 f"{len(remaining)} episode ditunda ke chunk berikutnya.")
             break
         say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
-        try:
-            r = process_episode(domain, dp, se, ep, judul, tahun, is_tv)
-        except urllib.error.HTTPError as e:
+        if st.get("slug"):
+            # upload OK dari run/chunk sebelumnya → register-saja
             try:
-                domain = mb_domain()
-            except Exception:
-                pass
-            r = {"ep": ep, "ok": False, "error": f"play API HTTP {e.code}"}
-        except Exception as e:
-            r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
+                r = register_resume_mb(domain, dp, se, ep, st, is_tv)
+            except Exception as e:
+                r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
+        else:
+            try:
+                r = process_episode(domain, dp, se, ep, judul, tahun, is_tv)
+            except urllib.error.HTTPError as e:
+                try:
+                    domain = mb_domain()
+                except Exception:
+                    pass
+                r = {"ep": ep, "ok": False, "error": f"play API HTTP {e.code}"}
+            except Exception as e:
+                r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
         results.append(r)
+        state_record(state, state_f, ep, r)
         if r.get("ok"):
-            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}")
+            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}"
+                + ("  [dilewati — state]" if r.get("skip") else ""))
         else:
             say(f"  ✘ E{ep} GAGAL: {r.get('error')}")
 
@@ -983,6 +1125,8 @@ def run_bulk(domain, dp, sel, is_tv, eps):
         r["reg_error"] = None if reg.get("ok") else str(reg.get("error"))[:160]
         say(f"  register ulang E{r['ep']}: "
             + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+        if r.get("reg_ok"):
+            state_record(state, state_f, r["ep"], r)
 
     ok_n = sum(1 for r in results if r.get("ok"))
     reg_n = sum(1 for r in results if r.get("reg_ok"))
@@ -1246,28 +1390,69 @@ def lk21_process_one(dom, sel, ep, is_tv, base_det=None):
 
 def run_bulk_lk21(dom, sel, eps, base_det=None):
     """Bulk LK21 (series): pola sama dgn run_bulk MovieBox — satu episode
-    per iterasi + budget chunk + marker ZS_BULK_REMAIN utk chunk lanjutan."""
+    per iterasi + budget chunk + marker ZS_BULK_REMAIN utk chunk lanjutan.
+    [v1.2.5] state resumable (pola state bulk moviebox): episode
+    terdaftar → lewati; slug ada tapi register belum → register-saja."""
     judul = sel.get("title") or "series"
     se = SEASON
     say(f"\nMODE BULK LK21: {len(eps)} episode (S{se}, judul '{judul}') — "
         f"budget chunk {BUDGET_MIN} menit")
     summary_line(f"- Mode: **BULK LK21** — {len(eps)} episode S{se} "
                  f"(chunk ±{BUDGET_MIN} menit)")
+
+    state_f = series_state_file(
+        series_state_key(judul, se, sel.get("slug") or "lk21"))
+    state = series_state_load(state_f)
+    note = state_note(state)
+    if note:
+        say(f"State serial dimuat: {note} → tidak diunduh ulang.")
+        summary_line(f"- State serial: {note} (dilewati/register-saja)")
+
     results, remaining, t0 = [], [], time.time()
     for i, ep in enumerate(eps):
+        st = state.get(str(ep)) or {}
+        if st.get("registered"):
+            say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) — "
+                f"sudah terdaftar (slug {st.get('slug')}), LEWATI ===")
+            results.append({"ep": ep, "ok": True, "reg_ok": True,
+                            "slug": st.get("slug"), "skip": True})
+            continue
         if i > 0 and (time.time() - t0) > BUDGET_MIN * 60:
             remaining = eps[i:]
             say(f"\n⏸ Budget chunk tercapai ({BUDGET_MIN} mnt) — "
                 f"{len(remaining)} episode ditunda ke chunk berikutnya.")
             break
         say(f"\n=== EPISODE {ep} ({i + 1}/{len(eps)}) ===")
-        try:
-            r = lk21_process_one(dom, sel, ep, True, base_det)
-        except Exception as e:
-            r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
+        if st.get("slug"):
+            # upload OK dari run/chunk sebelumnya → register-saja
+            # (subtitle LK21 tak diambil ulang — perlu resolve halaman;
+            # bisa ditambahkan via Admin → Subtitle bila perlu)
+            say(f"  unduh+upload DILEWATI (slug dari state: "
+                f"{st.get('slug')}) — register…")
+            reg = register_one(st["slug"], ep, st.get("quality"),
+                               int(st.get("size") or 0), None, None, True)
+            r = {"ep": ep, "ok": True, "slug": st["slug"],
+                 "res": st.get("quality"),
+                 "size": int(st.get("size") or 0),
+                 "reg_ok": bool(reg.get("ok")) and not reg.get("skip"),
+                 "reg_skip": reg.get("skip"),
+                 "reg_error": None if reg.get("ok")
+                 else str(reg.get("error"))[:160]}
+            if reg.get("retry"):
+                r["reg_pending"] = True
+            else:
+                say("  register:", "OK" if reg.get("ok")
+                    else f"GAGAL — {str(reg.get('error'))[:120]}")
+        else:
+            try:
+                r = lk21_process_one(dom, sel, ep, True, base_det)
+            except Exception as e:
+                r = {"ep": ep, "ok": False, "error": repr(e)[:160]}
         results.append(r)
+        state_record(state, state_f, ep, r)
         if r.get("ok"):
-            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}")
+            say(f"  ✔ E{ep} SELESAI — slug {r.get('slug')}"
+                + ("  [dilewati — state]" if r.get("skip") else ""))
         else:
             say(f"  ✘ E{ep} GAGAL: {r.get('error')}")
 
@@ -1282,6 +1467,8 @@ def run_bulk_lk21(dom, sel, eps, base_det=None):
         r["reg_error"] = None if reg.get("ok") else str(reg.get("error"))[:160]
         say(f"  register ulang E{r['ep']}: "
             + ("OK" if r["reg_ok"] else "masih diproses Abyss"))
+        if r.get("reg_ok"):
+            state_record(state, state_f, r["ep"], r)
 
     ok_n = sum(1 for r in results if r.get("ok"))
     reg_n = sum(1 for r in results if r.get("reg_ok"))

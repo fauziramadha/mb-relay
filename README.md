@@ -295,6 +295,7 @@ karakter.
 | Film tidak muncul di situs padahal run SUKSES | Input **token** kosong — film tetap ada di Abyss (slug tertera di log). Daftarkan manual: Admin → Server 3 → tempel slug, ATAU run ulang workflow dengan judul sama + token + **slug_lama** (register-saja, cepat, tanpa unduh ulang). |
 | `HTTP 503` di log awal (get-domain / play / caption) | API BFF MovieBox **intermiten 503** (gangguan di sisi mereka, acak per-request). v1.2.3: pipeline otomatis retry 6× tiap 5 dtk — hampir pasti lolos. Kalau masih gagal 6× berarti sumber benar-benar down → tunggu beberapa jam lalu run ulang. |
 | `Upload Abyss ditolak` + `exit 26` + `0 MB` di semua endpoint | Judul film mengandung **koma / titik-koma** — di v1.2.3 ke bawah koma dianggap pemisah multi-file oleh `curl -F` sehingga file dianggap tidak ada (kasus "One Year to Live, Buy a Man", 6 Nov 2026). Sudah diperbaiki di **v1.2.4**: run ulang dengan input yang sama — file lama di Codespace dipakai lagi tanpa unduh ulang. |
+| Bulk serial **mengulang dari episode 1** setelah run mati/restart | v1.2.3 ke bawah: jalur moviebox/LK21 tidak punya posisi episode, jadi saat Codespace mati idle-timeout dan monitor menjalankan ulang job, daftar episode dijalankan dari awal. Sudah diperbaiki di **v1.2.5** (state `dl_state/` per seri): episode yang sudah terdaftar otomatis **dilewati**, yang sudah terupload tapi belum register hanya **register ulang** tanpa unduh. Run ulang workflow dengan input yang sama — lanjut dari posisi terakhir. |
 | Transcode Abyss > 15 menit | Tidak masalah — register tetap dilakukan; status bisa dicek di dashboard Abyss (player.abyssplayer.com). |
 | Subtitle tidak muncul di halaman film | Pastikan film terdaftar di katalog dulu, lalu cek **Admin → Subtitle**: bahasa/offset bisa dikoreksi & "pasang ulang ke player" di sana. |
 | `subtitles 403` / `HTTP 403` saat pasang subtitle | Sudah diperbaiki di versi sekarang (curl + UA browser). Kalau masih muncul: Codespace belum menarik kode terbaru → Restart Codespace sekali lalu run ulang. |
@@ -357,6 +358,17 @@ rute Render juga ditinggalkan — wajib kartu + IP-nya diblokir CDN.)
   kutip ganda di nama diganti kutip tunggal); pemulihan katalog ikut
   mencocokkan nama baru. Berlaku untuk semua sumber (moviebox /
   lk21 / manual / hianime / serial).
+- **v1.2.5** (8 Nov 2026) — **state resumable untuk bulk serial
+  moviebox & LK21** (pola state hianime dipakai ke semua sumber).
+  Insiden 7 Nov 2026 ("The Lament of Autumn", 40 ep): Codespace mati
+  idle-timeout setelah ep 24 → monitor menjalankan ulang job dengan
+  daftar episode penuh → run mengulang dari ep 1 (menimpa log dengan
+  unduhan ulang). Kini: file state `dl_state/state-{seri}.json` per
+  seri (judul+musim+hash detailPath) — episode **terdaftar → lewat**;
+  **sudah upload belum register → register-saja** dengan slug lama
+  (subtitle resmi diambil ulang utk moviebox); state disimpan SEGERA
+  setiap episode selesai (crash-safe). Register kualitas kosong
+  diisi otomatis dari Abyss.
 
 ---
 
