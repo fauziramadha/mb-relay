@@ -86,6 +86,9 @@ SOURCE = (os.environ.get("ZS_SOURCE") or "moviebox").strip().lower()
 # (tidak bisa otomatis server-side) — user menempel link finalnya.
 LINK = (os.environ.get("ZS_LINK") or "").strip()
 TIPE = (os.environ.get("ZS_TIPE") or "").strip().lower()  # movie|tv
+# [v1.2.5] TMDB ID judul (dikirim admin panel) — dipakai utk menyinkron-
+# kan state bulk dgn KATALOG situs via API publik /api/v3/status
+TMDB_ID = (os.environ.get("ZS_TMDB") or "").strip()
 ABYSS_KEY = os.environ.get("ABYSS_KEY", "")
 ABYSS_EMAIL = os.environ.get("ABYSS_EMAIL", "")
 ABYSS_PASSWORD = os.environ.get("ABYSS_PASSWORD", "")
@@ -108,6 +111,7 @@ if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
     SOURCE = str(_p.get("source") or SOURCE).strip().lower()
     LINK = str(_p.get("link") or LINK).strip()
     TIPE = str(_p.get("tipe") or TIPE).strip().lower()
+    TMDB_ID = str(_p.get("tmdb") or TMDB_ID).strip()
     ABYSS_KEY = _p.get("abyss_key") or ABYSS_KEY
     ABYSS_EMAIL = _p.get("abyss_email") or ABYSS_EMAIL
     ABYSS_PASSWORD = _p.get("abyss_password") or ABYSS_PASSWORD
@@ -1010,6 +1014,77 @@ def state_record(state, state_f, ep, r):
     series_state_save(state_f, state)
 
 
+def catalog_episode_registered(ep):
+    """[v1.2.5] Cek API PUBLIK situs: episode ini sudah terdaftar di
+    katalog Server 3? (GET /api/v3/status — tanpa auth, cache edge 60 dtk;
+    curl + UA browser + Referer, pola _register_curl — urllib ditolak WAF
+    di sebagian jaringan). Return dict {quality,size} bila YA, None bila
+    TIDAK, {} (kosong) bila tak diketahui/jaringan gagal."""
+    if not (TMDB_ID and str(ep).isdigit()):
+        return None
+    url = ("https://www.zeestream.biz.id/api/v3/status"
+           f"?type=tv&id={TMDB_ID}&s={SEASON}&e={ep}")
+    try:
+        p = subprocess.run(
+            ["curl", "-sS", "-m", "25", "-A", UA,
+             "-H", "Referer: https://www.zeestream.biz.id/", url],
+            capture_output=True, timeout=30)
+        d = json.loads(p.stdout or b"{}")
+    except Exception:
+        return {}
+    if d.get("status") == "yes":
+        try:
+            q = int(re.sub(r"[^0-9]", "",
+                           str(d.get("quality") or "")) or 0) or None
+        except (TypeError, ValueError):
+            q = None
+        try:
+            sz = int(d.get("size") or 0)
+        except (TypeError, ValueError):
+            sz = 0
+        return {"quality": q, "size": sz}
+    if d.get("status") == "no":
+        return None
+    return {}          # unknown / error → jangan ambil keputusan
+
+
+def sync_state_with_catalog(state, state_f, eps, log=lambda s: None):
+    """[v1.2.5] Sinkronkan state bulk dgn KATALOG situs (butuh TMDB_ID):
+    - katalog bilang ADA   → tandai registered (semai state utk episode
+      run lama sebelum v1.2.5 / codespace baru — tak diunduh ulang);
+    - katalog bilang TIDAK → hapus tanda registered (entry dihapus via
+      Admin → episode diunduh ulang saat run berikutnya).
+    Jawaban "unknown" (jaringan/WAF) TIDAK mengubah apa pun (aman).
+    Return (n_seed, n_unmark)."""
+    if not TMDB_ID:
+        return 0, 0
+    n_seed = n_unmark = 0
+    for ep in eps:
+        info = catalog_episode_registered(ep)
+        if info:
+            ent = state.setdefault(str(ep), {})
+            if not ent.get("registered"):
+                ent["registered"] = True
+                ent["at"] = time.strftime("%Y-%m-%d %H:%M")
+                ent.setdefault("quality", info.get("quality"))
+                ent.setdefault("size", info.get("size") or 0)
+                n_seed += 1
+        elif info is None and str(ep) in state \
+                and state[str(ep)].get("registered"):
+            state[str(ep)]["registered"] = False
+            n_unmark += 1
+    if n_seed or n_unmark:
+        series_state_save(state_f, state)
+        bag = []
+        if n_seed:
+            bag.append(f"{n_seed} episode terdaftar di katalog → dilewati")
+        if n_unmark:
+            bag.append(f"{n_unmark} episode dihapus dari katalog → "
+                       "akan diunduh ulang")
+        log("Sinkron katalog situs: " + "; ".join(bag) + ".")
+    return n_seed, n_unmark
+
+
 def register_resume_mb(domain, dp, se, ep, st, is_tv):
     """[v1.2.5] Episode moviebox yang SUDAH terupload (slug di state)
     tapi register belum selesai (run mati / Abyss masih mem-proses /
@@ -1065,9 +1140,12 @@ def run_bulk(domain, dp, sel, is_tv, eps):
                  f"(chunk ±{BUDGET_MIN} menit)")
 
     # [v1.2.5] state resumable — episode terdaftar → lewati; punya slug
-    # tapi belum register → register-saja (tanpa unduh ulang)
+    # tapi belum register → register-saja (tanpa unduh ulang).
+    # State juga disinkronkan dgn KATALOG situs (bila TMDB_ID dikirim):
+    # episode yang sudah terdaftar dari run lama otomatis dilewati.
     state_f = series_state_file(series_state_key(judul, se, dp))
     state = series_state_load(state_f)
+    sync_state_with_catalog(state, state_f, eps, log=say)
     note = state_note(state)
     if note:
         say(f"State serial dimuat: {note} → tidak diunduh ulang.")
@@ -1403,6 +1481,7 @@ def run_bulk_lk21(dom, sel, eps, base_det=None):
     state_f = series_state_file(
         series_state_key(judul, se, sel.get("slug") or "lk21"))
     state = series_state_load(state_f)
+    sync_state_with_catalog(state, state_f, eps, log=say)
     note = state_note(state)
     if note:
         say(f"State serial dimuat: {note} → tidak diunduh ulang.")
