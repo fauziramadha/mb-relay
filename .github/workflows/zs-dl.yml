@@ -72,6 +72,10 @@ on:
         description: "Slug Abyss run sebelumnya, mis. SGZKkyR9C (isi = register-saja TANPA unduh/upload ulang). hianime bulk: pasangan abs=slug, mis. 1=MxCWqhgPq,2=AbCd1234"
         required: false
         default: ""
+      tmdb:
+        description: "[v1.2.5] TMDB ID judul (diisi otomatis dari panel Admin) — pipeline mengecek katalog situs via API publik /api/v3/status: episode yang SUDAH terdaftar otomatis dilewati (bulk serial moviebox/LK21)"
+        required: false
+        default: ""
 
 concurrency:
   group: zs-dl
@@ -107,6 +111,7 @@ jobs:
           I_SUBTITLE: ${{ inputs.subtitle }}
           I_TOKEN: ${{ inputs.token }}
           I_SLUG_LAMA: ${{ inputs.slug_lama }}
+          I_TMDB: ${{ inputs.tmdb }}
           ABYSS_KEY: ${{ secrets.ABYSS_KEY }}
           ABYSS_EMAIL: ${{ secrets.ABYSS_EMAIL }}
           ABYSS_PASSWORD: ${{ secrets.ABYSS_PASSWORD }}
@@ -127,6 +132,7 @@ jobs:
               "sub": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
               "reuse_slug": os.environ["I_SLUG_LAMA"] or "",
+              "tmdb": os.environ["I_TMDB"] or "",
               "abyss_key": os.environ["ABYSS_KEY"],
               "abyss_email": os.environ["ABYSS_EMAIL"],
               "abyss_password": os.environ["ABYSS_PASSWORD"],
@@ -508,6 +514,7 @@ jobs:
               "subtitle": os.environ["I_SUBTITLE"] or "in_id",
               "token": os.environ["I_TOKEN"] or "",
               "slug_lama": "",
+              "tmdb": os.environ["I_TMDB"] or "",
           }
           body = json.dumps({"ref": "main", "inputs": inputs}).encode()
 
